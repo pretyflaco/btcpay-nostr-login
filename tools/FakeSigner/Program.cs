@@ -84,6 +84,8 @@ await foreach (var evt in client.SubscribeForEvents(filters, false, cts.Token))
             };
             await toSign.ComputeIdAndSignAsync(signerKey, handlenip4: false);
             await Send(new Rpc { Id = req.Id, Result = JsonSerializer.Serialize(toSign) });
+            // Give the relay client time to flush before disposing
+            await Task.Delay(TimeSpan.FromSeconds(3));
             Console.WriteLine("signed and sent event, done");
             return 0;
     }

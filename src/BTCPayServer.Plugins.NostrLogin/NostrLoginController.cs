@@ -77,7 +77,7 @@ public class NostrLoginController : Controller
     [HttpGet("/login/nostr")]
     public async Task<IActionResult> Login(string? returnUrl = null)
     {
-        var session = _nostrLoginService.CreateSession(Nip46SessionPurpose.Login, await GetRelays(), "BTCPay Server");
+        var session = await _nostrLoginService.CreateSessionAsync(Nip46SessionPurpose.Login, await GetRelays(), "BTCPay Server");
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
     }
@@ -166,7 +166,7 @@ public class NostrLoginController : Controller
         var user = await _userManager.GetUserAsync(User);
         if (user is null)
             return NotFound();
-        var session = _nostrLoginService.CreateSession(Nip46SessionPurpose.Link, await GetRelays(), "BTCPay Server", user.Id);
+        var session = await _nostrLoginService.CreateSessionAsync(Nip46SessionPurpose.Link, await GetRelays(), "BTCPay Server", user.Id);
         return RedirectToAction(nameof(Account), new { linkSession = session.Id });
     }
 

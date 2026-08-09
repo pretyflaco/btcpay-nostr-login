@@ -15,7 +15,8 @@ Early MVP / proof of concept. Validates that a BTCPay plugin can own a complete 
 - [x] npub → BTCPay user linking at `/account/nostr` (proof of possession via the same NIP-46 flow), optional auto-create behind a feature flag (off by default)
 - [x] Standard cookie issuance via `SignInManager` after the core `CanLogin` policy checks
 - [x] End-to-end validated against public relays (see `tools/FakeSigner`, a minimal NIP-46 signer CLI for development)
-- [ ] End-to-end validated with Amber (Android)
+- [x] End-to-end validated with Amber (Android)
+- [x] "NostrConnect" button on the core `/login` page, next to Passkey and LoginCode (injected via a response-rewriting startup filter, since `Login.cshtml` has no UI extension point; degrades gracefully if the markup anchor is not found)
 
 Deliberately out of scope for the MVP: disabling password login, session-to-origin binding hardening (anti-QRLjacking), and any subscription/LN-address gating.
 

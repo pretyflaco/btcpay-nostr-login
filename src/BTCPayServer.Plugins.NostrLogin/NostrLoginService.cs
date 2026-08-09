@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -51,14 +52,17 @@ public class Nip46Session
 
 /// <summary>
 /// Manages NIP-46 (Nostr Connect) sign-in sessions. For each session an ephemeral client key
-/// is generated and a nostrconnect:// URI is displayed as QR code. A background task connects
-/// to the relays, waits for the signer's connect ack, requests the user pubkey and a signed
-/// kind-22242 challenge event, verifies it, and marks the session approved.
+/// is generated and a nostrconnect:// URI is displayed as QR code. The relay connections and
+/// the kind-24133 subscription are established BEFORE the session is returned (and the QR is
+/// rendered): the signer's connect ack is an ephemeral event sent exactly once, so we must
+/// already be listening when the signer scans. A background task then drives the RPC flow
+/// (connect ack -> get_public_key -> sign_event kind-22242) and validates the result.
 /// </summary>
 public class NostrLoginService : IDisposable
 {
     public static readonly string[] DefaultRelays = ["wss://nos.lol", "wss://relay.primal.net"];
     private static readonly TimeSpan SessionLifetime = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan RelayConnectTimeout = TimeSpan.FromSeconds(15);
     private const int SignedEventMaxAgeMinutes = 10;
 
     private readonly ConcurrentDictionary<string, Nip46Session> _sessions = new();
@@ -69,7 +73,7 @@ public class NostrLoginService : IDisposable
         _logger = logger;
     }
 
-    public Nip46Session CreateSession(Nip46SessionPurpose purpose, string[] relays, string appName, string? linkUserId = null)
+    public async Task<Nip46Session> CreateSessionAsync(Nip46SessionPurpose purpose, string[] relays, string appName, string? linkUserId = null)
     {
         Cleanup();
         if (relays.Length == 0)
@@ -94,12 +98,62 @@ public class NostrLoginService : IDisposable
         };
         _sessions[session.Id] = session;
         session.Cts.CancelAfter(SessionLifetime);
+        var ct = session.Cts.Token;
+
+        // Connect per relay and tolerate partial failures: one dead relay must not kill the session.
+        var clients = new List<NostrClient>();
+        foreach (var relay in relays)
+        {
+            var relayClient = new NostrClient(new Uri(relay));
+            try
+            {
+                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                connectCts.CancelAfter(RelayConnectTimeout);
+                await relayClient.ConnectAndWaitUntilConnected(connectCts.Token, ct);
+                clients.Add(relayClient);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("NostrLogin session {SessionId}: could not connect to relay {Relay}: {Error}",
+                    session.Id, relay, ex.Message);
+                relayClient.Dispose();
+            }
+        }
+        if (clients.Count == 0)
+        {
+            Fail(session, "Could not connect to any nostr relay.");
+            clientKey.Dispose();
+            return session;
+        }
+
+        // Subscribe before handing out the QR: the connect ack is sent exactly once.
+        var events = Channel.CreateUnbounded<NostrEvent>();
+        var subscriptionId = Guid.NewGuid().ToString("N");
+        var filters = new[]
+        {
+            new NostrSubscriptionFilter
+            {
+                Kinds = [24133],
+                ReferencedPublicKeys = [clientPubkey]
+            }
+        };
+        foreach (var relayClient in clients)
+        {
+            relayClient.EventsReceived += (_, args) =>
+            {
+                if (args.subscriptionId != subscriptionId)
+                    return;
+                foreach (var evt in args.events)
+                    events.Writer.TryWrite(evt);
+            };
+            await relayClient.CreateSubscription(subscriptionId, filters, ct);
+        }
 
         _ = Task.Run(async () =>
         {
             try
             {
-                await RunSessionAsync(session, clientKey, clientPubkey, secret, relays, session.Cts.Token);
+                await ProcessAsync(session, clientKey, clientPubkey, secret, clients, events, ct);
             }
             catch (OperationCanceledException)
             {
@@ -112,6 +166,16 @@ public class NostrLoginService : IDisposable
             }
             finally
             {
+                foreach (var relayClient in clients)
+                {
+                    try
+                    {
+                        relayClient.Dispose();
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
                 clientKey.Dispose();
             }
         });
@@ -153,59 +217,9 @@ public class NostrLoginService : IDisposable
         [JsonPropertyName("error")] public string? Error { get; set; }
     }
 
-    private async Task RunSessionAsync(Nip46Session session, ECPrivKey clientKey, string clientPubkey,
-        string secret, string[] relays, CancellationToken ct)
+    private async Task ProcessAsync(Nip46Session session, ECPrivKey clientKey, string clientPubkey,
+        string secret, List<NostrClient> clients, Channel<NostrEvent> events, CancellationToken ct)
     {
-        // Connect per relay and tolerate partial failures: one dead relay must not kill the session.
-        var clients = new List<NostrClient>();
-        foreach (var relay in relays)
-        {
-            var relayClient = new NostrClient(new Uri(relay));
-            try
-            {
-                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                connectCts.CancelAfter(TimeSpan.FromSeconds(15));
-                await relayClient.ConnectAndWaitUntilConnected(connectCts.Token, ct);
-                clients.Add(relayClient);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning("NostrLogin session {SessionId}: could not connect to relay {Relay}: {Error}",
-                    session.Id, relay, ex.Message);
-                relayClient.Dispose();
-            }
-        }
-        if (clients.Count == 0)
-        {
-            Fail(session, "Could not connect to any nostr relay.");
-            return;
-        }
-
-        var filters = new[]
-        {
-            new NostrSubscriptionFilter
-            {
-                Kinds = [24133],
-                ReferencedPublicKeys = [clientPubkey]
-            }
-        };
-
-        var events = Channel.CreateUnbounded<NostrEvent>();
-        foreach (var relayClient in clients)
-        {
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await foreach (var evt in relayClient.SubscribeForEvents(filters, false, ct))
-                        events.Writer.TryWrite(evt);
-                }
-                catch (OperationCanceledException)
-                {
-                }
-            }, ct);
-        }
-
         async Task Publish(NostrEvent evt)
         {
             foreach (var relayClient in clients)
@@ -221,19 +235,17 @@ public class NostrLoginService : IDisposable
             }
         }
 
-        try
-        {
         string? signerPubkey = null;
         string? userPubkey = null;
         var useNip04 = false;
         string? getPubkeyRequestId = null;
         string? signRequestId = null;
         string? challenge = null;
-        var seenEventIds = new ConcurrentDictionary<string, byte>();
+        var seenEventIds = new HashSet<string>();
 
         await foreach (var evt in events.Reader.ReadAllAsync(ct))
         {
-            if (evt.Id is null || !seenEventIds.TryAdd(evt.Id, 0))
+            if (evt.Id is null || !seenEventIds.Add(evt.Id))
                 continue; // deduplicate across relays
             if (signerPubkey is not null && evt.PublicKey != signerPubkey)
                 continue;
@@ -330,20 +342,6 @@ public class NostrLoginService : IDisposable
                 session.Status = Nip46SessionStatus.Approved;
                 _logger.LogInformation("NostrLogin session {SessionId} approved for pubkey {Pubkey}", session.Id, userPubkey);
                 return;
-            }
-        }
-        }
-        finally
-        {
-            foreach (var relayClient in clients)
-            {
-                try
-                {
-                    relayClient.Dispose();
-                }
-                catch (Exception)
-                {
-                }
             }
         }
     }
