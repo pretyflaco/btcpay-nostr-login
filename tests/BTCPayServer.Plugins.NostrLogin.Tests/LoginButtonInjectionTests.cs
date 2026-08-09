@@ -26,6 +26,16 @@ public class LoginButtonInjectionTests
     }
 
     [Fact]
+    public void InjectsResponsiveWrapStyle()
+    {
+        var result = LoginButtonInjectionMiddleware.TryInjectButton(LoginPageFragment, "", null);
+        Assert.NotNull(result);
+        // The row must be allowed to wrap so the third button doesn't clip on mobile.
+        Assert.Contains("flex-wrap:wrap", result);
+        Assert.Contains("flex:1 1 120px", result);
+    }
+
+    [Fact]
     public void PassesThroughReturnUrlAndPathBase()
     {
         var result = LoginButtonInjectionMiddleware.TryInjectButton(LoginPageFragment, "/btcpay", "/stores/abc");

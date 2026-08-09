@@ -92,10 +92,19 @@ public class LoginButtonInjectionMiddleware
         if (!string.IsNullOrEmpty(returnUrl))
             href += "?returnUrl=" + Uri.EscapeDataString(returnUrl);
 
+        // The button plus a scoped style so the three-item row wraps on narrow screens
+        // instead of clipping the extra button (core's row is d-flex with no wrap and the
+        // buttons don't all shrink evenly). flex-basis lets 3 sit inline on desktop and the
+        // third drop to its own full-width line on mobile. CSP on /login only restricts
+        // script-src, so an inline <style> is permitted.
         var button =
-            $"<a href=\"{href}\" class=\"btn btn-outline-secondary w-100\" id=\"nostr-login-btn\" title=\"Sign in with a NIP-46 Nostr signer\">" +
+            $"<a href=\"{href}\" class=\"btn btn-outline-secondary w-100 nostr-login-btn\" id=\"nostr-login-btn\" title=\"Sign in with a NIP-46 Nostr signer\">" +
             $"<svg role=\"img\" class=\"icon icon-social-nostr\"><use href=\"{pathBase}/img/icon-sprite.svg#social-nostr\"></use></svg>" +
-            "<span>NostrConnect</span></a>";
+            "<span>NostrConnect</span></a>" +
+            "<style>" +
+            "#login-form .d-flex.gap-2{flex-wrap:wrap;}" +
+            "#login-form .d-flex.gap-2>.btn{flex:1 1 120px;}" +
+            "</style>";
 
         return html.Insert(insertAt, button);
     }
