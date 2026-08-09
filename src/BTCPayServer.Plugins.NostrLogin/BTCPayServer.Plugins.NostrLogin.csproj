@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <Product>Nostr Login</Product>
     <Description>Sign in to BTCPay Server with a NIP-46 Nostr remote signer (Nostr Connect). Additive: password, Passkey and LoginCode remain untouched.</Description>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
   </PropertyGroup>
 
   <!-- Plugin development properties -->
@@ -59,6 +59,10 @@
 
   <ItemGroup>
     <PackageReference Include="NNostr.Client" Version="0.0.54" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BTCPayServer.Plugins.NostrLogin.Tests" />
   </ItemGroup>
 
   <ItemGroup>

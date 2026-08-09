@@ -73,6 +73,13 @@ public class LoginButtonInjectionMiddleware
 
     private static string? TryInjectButton(string html, HttpRequest request)
     {
+        var pathBase = request.PathBase.HasValue ? request.PathBase.Value : "";
+        var returnUrl = request.Query["returnUrl"];
+        return TryInjectButton(html, pathBase ?? "", returnUrl);
+    }
+
+    internal static string? TryInjectButton(string html, string pathBase, string? returnUrl)
+    {
         var anchorIndex = html.IndexOf(Anchor, StringComparison.Ordinal);
         if (anchorIndex < 0)
             return null;
@@ -81,11 +88,9 @@ public class LoginButtonInjectionMiddleware
             return null;
         insertAt += "</button>".Length;
 
-        var pathBase = request.PathBase.HasValue ? request.PathBase.Value : "";
         var href = $"{pathBase}/login/nostr";
-        var returnUrl = request.Query["returnUrl"];
         if (!string.IsNullOrEmpty(returnUrl))
-            href += "?returnUrl=" + Uri.EscapeDataString(returnUrl!);
+            href += "?returnUrl=" + Uri.EscapeDataString(returnUrl);
 
         var button =
             $"<a href=\"{href}\" class=\"btn btn-outline-secondary w-100\" id=\"nostr-login-btn\" title=\"Sign in with a NIP-46 Nostr signer\">" +

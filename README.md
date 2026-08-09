@@ -17,8 +17,13 @@ Early MVP / proof of concept. Validates that a BTCPay plugin can own a complete 
 - [x] End-to-end validated against public relays (see `tools/FakeSigner`, a minimal NIP-46 signer CLI for development)
 - [x] End-to-end validated with Amber (Android)
 - [x] "NostrConnect" button on the core `/login` page, next to Passkey and LoginCode (injected via a response-rewriting startup filter, since `Login.cshtml` has no UI extension point; degrades gracefully if the markup anchor is not found)
+- [x] CSRF protection on all state-changing endpoints (controller follows the `UI*` naming convention required by BTCPay's global antiforgery filter)
+- [x] Server settings page at `/server/nostr-login` (admin only): toggle account creation via Nostr, configure relays
+- [x] Account creation via Nostr (off by default) honors the server's registration policies: disabled registration, required email confirmation, and admin approval
 
-Deliberately out of scope for the MVP: disabling password login, session-to-origin binding hardening (anti-QRLjacking), and any subscription/LN-address gating.
+Deliberately out of scope for now: session-to-origin binding hardening (anti-QRLjacking) and rate limiting on session creation (BTCPay core applies none to `/login` either).
+
+Deliberately out of scope for the MVP: disabling password login and any subscription/LN-address gating.
 
 ## Requirements
 

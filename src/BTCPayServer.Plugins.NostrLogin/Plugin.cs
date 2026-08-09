@@ -16,5 +16,6 @@ public class Plugin : BaseBTCPayServerPlugin
         services.AddSingleton<NostrLoginService>();
         services.AddSingleton<Microsoft.AspNetCore.Hosting.IStartupFilter, NostrLoginStartupFilter>();
         services.AddUIExtension("user-nav", "/Views/NostrLogin/UserNav.cshtml");
+        services.AddUIExtension("server-nav", "/Views/NostrLogin/ServerNav.cshtml");
     }
 }

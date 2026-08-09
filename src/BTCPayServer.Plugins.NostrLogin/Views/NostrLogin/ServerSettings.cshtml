@@ -1,0 +1,41 @@
+@model BTCPayServer.Plugins.NostrLogin.NostrLoginServerSettingsViewModel
+@{
+    ViewData.SetLayoutModel(new LayoutModel("NostrLogin", "Nostr Login").SetCategory(WellKnownCategories.Server));
+    Layout = "_Layout";
+}
+
+<div class="sticky-header">
+    <h2>Nostr Login</h2>
+</div>
+<partial name="_StatusMessage" />
+
+<div class="row">
+    <div class="col-xl-8 col-xxl-constrain">
+        <p>
+            <strong>@Model.LinkedKeyCount</strong> Nostr @(Model.LinkedKeyCount == 1 ? "key is" : "keys are") linked to accounts on this server.
+        </p>
+        <form method="post" asp-action="ServerSettings">
+            <div asp-validation-summary="ModelOnly" class="text-danger"></div>
+            <div class="form-check my-3">
+                <input asp-for="AllowAutoUserCreation" type="checkbox" class="form-check-input" />
+                <label asp-for="AllowAutoUserCreation" class="form-check-label">Allow account creation via Nostr sign-in</label>
+                <div class="form-text">
+                    When enabled, an unknown Nostr key completing sign-in at <code>/login/nostr</code> creates a new account
+                    (with a placeholder email). The server's registration policies still apply: registration must be open,
+                    email confirmation must not be required, and admin approval is honored.
+                    When disabled (default), only pre-linked keys can sign in.
+                </div>
+            </div>
+            <div class="form-group">
+                <label asp-for="Relays" class="form-label">Relays</label>
+                <textarea asp-for="Relays" class="form-control font-monospace" rows="4" placeholder="@string.Join("\n", Model.DefaultRelays)"></textarea>
+                <span asp-validation-for="Relays" class="text-danger"></span>
+                <div class="form-text">
+                    One <code>wss://</code> relay URL per line, encoded into the sign-in QR code.
+                    Leave empty to use the defaults: <code>@string.Join(", ", Model.DefaultRelays)</code>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary mt-3" id="SaveNostrLoginSettings">Save</button>
+        </form>
+    </div>
+</div>

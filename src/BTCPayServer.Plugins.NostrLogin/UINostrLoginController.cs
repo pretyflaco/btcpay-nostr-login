@@ -28,26 +28,40 @@ public class NostrAccountViewModel
     public NostrLoginViewModel? LinkSession { get; init; }
 }
 
-public class NostrLoginController : Controller
+public class NostrLoginServerSettingsViewModel
+{
+    public bool AllowAutoUserCreation { get; set; }
+
+    /// <summary>One relay URL per line; empty means the built-in defaults.</summary>
+    public string? Relays { get; set; }
+
+    public int LinkedKeyCount { get; set; }
+    public string[] DefaultRelays { get; set; } = [];
+}
+
+public class UINostrLoginController : Controller
 {
     private readonly NostrLoginService _nostrLoginService;
     private readonly SignInManager<ApplicationUser> _signInManager;
     private readonly UserManager<ApplicationUser> _userManager;
     private readonly UserService _userService;
     private readonly ISettingsRepository _settingsRepository;
+    private readonly PoliciesSettings _policiesSettings;
 
-    public NostrLoginController(
+    public UINostrLoginController(
         NostrLoginService nostrLoginService,
         SignInManager<ApplicationUser> signInManager,
         UserManager<ApplicationUser> userManager,
         UserService userService,
-        ISettingsRepository settingsRepository)
+        ISettingsRepository settingsRepository,
+        PoliciesSettings policiesSettings)
     {
         _nostrLoginService = nostrLoginService;
         _signInManager = signInManager;
         _userManager = userManager;
         _userService = userService;
         _settingsRepository = settingsRepository;
+        _policiesSettings = policiesSettings;
     }
 
     private async Task<string[]> GetRelays()
@@ -77,6 +91,9 @@ public class NostrLoginController : Controller
     [HttpGet("/login/nostr")]
     public async Task<IActionResult> Login(string? returnUrl = null)
     {
+        if (User.Identity?.IsAuthenticated is true)
+            return Redirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
+
         var session = await _nostrLoginService.CreateSessionAsync(Nip46SessionPurpose.Login, await GetRelays(), "BTCPay Server");
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
@@ -110,9 +127,10 @@ public class NostrLoginController : Controller
                     status = "failed",
                     error = "No account is linked to this Nostr key. Sign in another way and link it under Account -> Nostr."
                 });
-            user = await AutoCreateUser(pubkey);
-            if (user is null)
-                return Json(new { status = "failed", error = "Could not create a new account for this Nostr key." });
+            var (createdUser, createError) = await AutoCreateUser(pubkey);
+            if (createdUser is null)
+                return Json(new { status = "failed", error = createError ?? "Could not create a new account for this Nostr key." });
+            user = createdUser;
         }
 
         var canLoginContext = new UserService.CanLoginContext(user);
@@ -217,6 +235,47 @@ public class NostrLoginController : Controller
         return RedirectToAction(nameof(Account));
     }
 
+    [Authorize(Policy = BTCPayServer.Client.Policies.CanModifyServerSettings, AuthenticationSchemes = AuthenticationSchemes.Cookie)]
+    [HttpGet("/server/nostr-login")]
+    public async Task<IActionResult> ServerSettings()
+    {
+        var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
+        return View("/Views/NostrLogin/ServerSettings.cshtml", new NostrLoginServerSettingsViewModel
+        {
+            AllowAutoUserCreation = settings.AllowAutoUserCreation,
+            Relays = settings.Relays is { Count: > 0 } ? string.Join("\n", settings.Relays) : "",
+            LinkedKeyCount = (await GetUserMap()).PubkeyToUserId.Count,
+            DefaultRelays = NostrLoginService.DefaultRelays
+        });
+    }
+
+    [Authorize(Policy = BTCPayServer.Client.Policies.CanModifyServerSettings, AuthenticationSchemes = AuthenticationSchemes.Cookie)]
+    [HttpPost("/server/nostr-login")]
+    public async Task<IActionResult> ServerSettings(NostrLoginServerSettingsViewModel model)
+    {
+        var relays = (model.Relays ?? "")
+            .Split(['\n', '\r'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToList();
+        foreach (var relay in relays)
+        {
+            if (!Uri.TryCreate(relay, UriKind.Absolute, out var uri) || (uri.Scheme != "wss" && uri.Scheme != "ws"))
+                ModelState.AddModelError(nameof(model.Relays), $"Invalid relay URL: {relay} (must be ws:// or wss://)");
+        }
+        if (!ModelState.IsValid)
+        {
+            model.LinkedKeyCount = (await GetUserMap()).PubkeyToUserId.Count;
+            model.DefaultRelays = NostrLoginService.DefaultRelays;
+            return View("/Views/NostrLogin/ServerSettings.cshtml", model);
+        }
+
+        var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
+        settings.AllowAutoUserCreation = model.AllowAutoUserCreation;
+        settings.Relays = relays.Count > 0 ? relays : null;
+        await _settingsRepository.UpdateSetting(settings);
+        TempData[BTCPayServer.Abstractions.Constants.WellKnownTempData.SuccessMessage] = "Nostr Login settings updated.";
+        return RedirectToAction(nameof(ServerSettings));
+    }
+
     private async Task<NostrLoginUserMap> GetUserMap() =>
         await _settingsRepository.GetSettingAsync<NostrLoginUserMap>() ?? new NostrLoginUserMap();
 
@@ -228,8 +287,18 @@ public class NostrLoginController : Controller
             : null;
     }
 
-    private async Task<ApplicationUser?> AutoCreateUser(string pubkey)
+    /// <summary>
+    /// Creates a new account for an unknown npub. Only runs when AllowAutoUserCreation is
+    /// enabled, and even then defers to the server's own registration policies.
+    /// </summary>
+    private async Task<(ApplicationUser? User, string? Error)> AutoCreateUser(string pubkey)
     {
+        if (_policiesSettings.LockSubscription)
+            return (null, "New account registration is disabled on this server.");
+        if (_policiesSettings.RequiresConfirmedEmail)
+            return (null, "This server requires a confirmed email address; accounts cannot be created via Nostr sign-in. Register normally, then link your Nostr key.");
+
+        var requiresApproval = _policiesSettings.RequiresUserApproval;
         var email = $"nostr-{pubkey[..12]}@nostr.invalid";
         var user = new ApplicationUser
         {
@@ -237,8 +306,8 @@ public class NostrLoginController : Controller
             Email = email,
             EmailConfirmed = true,
             RequiresEmailConfirmation = false,
-            RequiresApproval = false,
-            Approved = true,
+            RequiresApproval = requiresApproval,
+            Approved = !requiresApproval,
             Created = DateTimeOffset.UtcNow
         };
         // Random password: never disclosed, only exists because accounts without a
@@ -246,11 +315,12 @@ public class NostrLoginController : Controller
         var password = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)) + "aA1!";
         var result = await _userManager.CreateAsync(user, password);
         if (!result.Succeeded)
-            return null;
+            return (null, "Could not create a new account for this Nostr key.");
         var map = await GetUserMap();
         map.PubkeyToUserId[pubkey] = user.Id;
         await _settingsRepository.UpdateSetting(map);
-        return user;
+        // With RequiresUserApproval the subsequent CanLogin check reports the pending state.
+        return (user, null);
     }
 }
 
