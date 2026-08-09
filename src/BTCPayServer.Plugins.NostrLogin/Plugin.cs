@@ -13,5 +13,7 @@ public class Plugin : BaseBTCPayServerPlugin
 
     public override void Execute(IServiceCollection services)
     {
+        services.AddSingleton<NostrLoginService>();
+        services.AddUIExtension("user-nav", "/Views/NostrLogin/UserNav.cshtml");
     }
 }

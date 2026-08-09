@@ -1,8 +1,10 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
   <!-- Plugin specific properties -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
     <Product>Nostr Login</Product>
     <Description>Sign in to BTCPay Server with a NIP-46 Nostr remote signer (Nostr Connect). Additive: password, Passkey and LoginCode remain untouched.</Description>
     <Version>0.1.0</Version>
@@ -48,6 +50,16 @@
     </ProjectReference>
   </ItemGroup>
   -->
+
+  <!-- Copy NuGet dependencies (NNostr.Client and friends) next to the plugin dll so the
+       plugin loader can resolve them both during DEBUG_PLUGINS and when packaged. -->
+  <PropertyGroup>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NNostr.Client" Version="0.0.54" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\submodules\btcpayserver\BTCPayServer\BTCPayServer.csproj" />

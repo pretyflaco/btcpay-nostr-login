@@ -10,10 +10,12 @@ This plugin is **purely additive**: password, Passkey and LoginCode sign-in rema
 
 Early MVP / proof of concept. Validates that a BTCPay plugin can own a complete alternative login vertical:
 
-- [ ] `/login/nostr` page rendering a `nostrconnect://` QR + URI
-- [ ] NIP-46 relay client: connect ack, `sign_event` request for a kind-22242 challenge, signature verification
-- [ ] npub → BTCPay user linking (account settings), optional auto-create behind a feature flag (off by default)
-- [ ] Standard cookie issuance via `SignInManager`
+- [x] `/login/nostr` page rendering a `nostrconnect://` QR + URI
+- [x] NIP-46 relay client: connect ack, `get_public_key`, `sign_event` request for a kind-22242 challenge, signature verification (NIP-44 with NIP-04 fallback)
+- [x] npub → BTCPay user linking at `/account/nostr` (proof of possession via the same NIP-46 flow), optional auto-create behind a feature flag (off by default)
+- [x] Standard cookie issuance via `SignInManager` after the core `CanLogin` policy checks
+- [x] End-to-end validated against public relays (see `tools/FakeSigner`, a minimal NIP-46 signer CLI for development)
+- [ ] End-to-end validated with Amber (Android)
 
 Deliberately out of scope for the MVP: disabling password login, session-to-origin binding hardening (anti-QRLjacking), and any subscription/LN-address gating.
 

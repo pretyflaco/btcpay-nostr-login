@@ -1,0 +1,53 @@
+@model BTCPayServer.Plugins.NostrLogin.NostrLoginViewModel
+@{
+    ViewData["Title"] = "Sign in with Nostr";
+    Layout = "_LayoutSignedOut";
+}
+
+<div class="text-center">
+    <p>
+        Scan this QR code with a NIP-46 signer app such as
+        <strong>Amber</strong> and approve the sign-in request.
+    </p>
+    <img src="@Model.QrDataUri" alt="Nostr Connect QR code" class="qr-code rounded" style="width:240px;height:240px;image-rendering:pixelated;" />
+    <div class="input-group mt-3">
+        <input type="text" class="form-control" readonly value="@Model.ConnectUri" id="ConnectUri" />
+        <button type="button" class="btn btn-outline-secondary" id="CopyUri">Copy</button>
+    </div>
+    <div class="d-flex align-items-center justify-content-center mt-4" id="NostrPending">
+        <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
+        <span class="ms-2 text-secondary">Waiting for signer approval&hellip;</span>
+    </div>
+    <div class="alert alert-danger mt-4" id="NostrError" style="display:none;"></div>
+    <div class="mt-4">
+        <a href="/login" id="BackToLogin">Sign in another way</a>
+    </div>
+</div>
+
+@section PageFootContent {
+    <script>
+        (function () {
+            var statusUrl = "@Model.StatusUrl";
+            document.getElementById("CopyUri").addEventListener("click", function () {
+                navigator.clipboard.writeText(document.getElementById("ConnectUri").value);
+                this.textContent = "Copied";
+            });
+            var timer = setInterval(async function () {
+                try {
+                    var response = await fetch(statusUrl);
+                    var data = await response.json();
+                    if (data.status === "approved") {
+                        clearInterval(timer);
+                        window.location.href = data.redirect;
+                    } else if (data.status === "failed") {
+                        clearInterval(timer);
+                        document.getElementById("NostrPending").style.display = "none";
+                        var err = document.getElementById("NostrError");
+                        err.textContent = data.error || "Sign-in failed.";
+                        err.style.display = "block";
+                    }
+                } catch (e) { /* transient network error: keep polling */ }
+            }, 2000);
+        })();
+    </script>
+}

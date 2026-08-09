@@ -1,0 +1,87 @@
+@using BTCPayServer.Abstractions.Extensions
+@using BTCPayServer.Abstractions.Models
+@model BTCPayServer.Plugins.NostrLogin.NostrAccountViewModel
+@{
+    ViewData.SetLayoutModel(new LayoutModel("NostrLogin", "Nostr").SetCategory("ManageNavPages"));
+    Layout = "_Layout";
+}
+
+<div class="sticky-header">
+    <h2>Nostr</h2>
+</div>
+<partial name="_StatusMessage" />
+
+<p>
+    Link a Nostr key to your account to sign in with a NIP-46 signer app
+    (such as <strong>Amber</strong>) at <code>/login/nostr</code>.
+</p>
+
+@if (Model.LinkedPubkeys.Length > 0)
+{
+    <h5 class="mt-4">Linked keys</h5>
+    <ul class="list-group mb-4">
+        @foreach (var pubkey in Model.LinkedPubkeys)
+        {
+            <li class="list-group-item d-flex justify-content-between align-items-center">
+                <code class="text-truncate me-3">@pubkey.ToNpub()</code>
+                <form method="post" asp-action="Unlink">
+                    <input type="hidden" name="pubkey" value="@pubkey" />
+                    <button type="submit" class="btn btn-sm btn-outline-danger">Unlink</button>
+                </form>
+            </li>
+        }
+    </ul>
+}
+else
+{
+    <p class="text-secondary">No Nostr key is linked to this account yet.</p>
+}
+
+@if (Model.LinkSession is null)
+{
+    <form method="post" asp-action="StartLink">
+        <button type="submit" class="btn btn-primary" id="StartLink">Link a Nostr key</button>
+    </form>
+}
+else
+{
+    <div class="text-center border rounded p-4" style="max-width:420px;">
+        <p>Scan with your NIP-46 signer app and approve the request.</p>
+        <img src="@Model.LinkSession.QrDataUri" alt="Nostr Connect QR code" class="qr-code rounded" style="width:240px;height:240px;image-rendering:pixelated;" />
+        <div class="input-group mt-3">
+            <input type="text" class="form-control" readonly value="@Model.LinkSession.ConnectUri" id="ConnectUri" />
+            <button type="button" class="btn btn-outline-secondary" id="CopyUri">Copy</button>
+        </div>
+        <div class="d-flex align-items-center justify-content-center mt-3" id="NostrPending">
+            <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
+            <span class="ms-2 text-secondary">Waiting for signer approval&hellip;</span>
+        </div>
+        <div class="alert alert-danger mt-3" id="NostrError" style="display:none;"></div>
+    </div>
+
+    <script>
+        (function () {
+            var statusUrl = "@Model.LinkSession.StatusUrl";
+            document.getElementById("CopyUri").addEventListener("click", function () {
+                navigator.clipboard.writeText(document.getElementById("ConnectUri").value);
+                this.textContent = "Copied";
+            });
+            var timer = setInterval(async function () {
+                try {
+                    var response = await fetch(statusUrl);
+                    var data = await response.json();
+                    if (data.status === "approved") {
+                        clearInterval(timer);
+                        window.location.href = data.redirect;
+                    } else if (data.status === "failed") {
+                        clearInterval(timer);
+                        document.getElementById("NostrPending").style.display = "none";
+                        var err = document.getElementById("NostrError");
+                        err.textContent = data.error || "Linking failed.";
+                        err.style.display = "block";
+                    }
+                } catch (e) { /* keep polling */ }
+            }, 2000);
+        })();
+    </script>
+}
