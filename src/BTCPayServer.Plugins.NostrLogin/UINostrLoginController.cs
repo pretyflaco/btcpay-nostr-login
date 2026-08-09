@@ -1,11 +1,13 @@
 using System;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 using BTCPayServer.Abstractions.Constants;
 using BTCPayServer.Abstractions.Contracts;
 using BTCPayServer.Data;
 using BTCPayServer.Services;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using NNostr.Client.Protocols;
@@ -20,6 +22,9 @@ public class NostrLoginViewModel
     public required string QrDataUri { get; init; }
     public required string StatusUrl { get; init; }
     public string? ReturnUrl { get; init; }
+
+    /// <summary>Set when the session was rejected before it could start (e.g. rate limited).</summary>
+    public string? InitialError { get; init; }
 }
 
 public class NostrAccountViewModel
@@ -64,20 +69,28 @@ public class UINostrLoginController : Controller
         _policiesSettings = policiesSettings;
     }
 
+    // M2: cookie that binds a login session to the browser that rendered its QR (anti-QRLjacking).
+    private const string BindCookieName = "NostrLogin.Bind";
+
     private async Task<string[]> GetRelays()
     {
         var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
         return settings.Relays is { Count: > 0 } ? settings.Relays.ToArray() : NostrLoginService.DefaultRelays;
     }
 
-    private NostrLoginViewModel ToViewModel(Nip46Session session, string statusUrl, string? returnUrl = null) => new()
+    private NostrLoginViewModel ToViewModel(Nip46Session session, string statusUrl, string? returnUrl = null)
     {
-        SessionId = session.Id,
-        ConnectUri = session.ConnectUri,
-        QrDataUri = GenerateQrDataUri(session.ConnectUri),
-        StatusUrl = statusUrl,
-        ReturnUrl = returnUrl
-    };
+        var failedUpFront = session.Status == Nip46SessionStatus.Failed;
+        return new()
+        {
+            SessionId = session.Id,
+            ConnectUri = session.ConnectUri,
+            QrDataUri = failedUpFront ? "" : GenerateQrDataUri(session.ConnectUri),
+            StatusUrl = statusUrl,
+            ReturnUrl = returnUrl,
+            InitialError = failedUpFront ? session.Error : null
+        };
+    }
 
     private static string GenerateQrDataUri(string data)
     {
@@ -94,7 +107,22 @@ public class UINostrLoginController : Controller
         if (User.Identity?.IsAuthenticated is true)
             return Redirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
 
-        var session = await _nostrLoginService.CreateSessionAsync(Nip46SessionPurpose.Login, await GetRelays(), "BTCPay Server");
+        // M2: mint a per-session nonce, bind it to this browser via a strict cookie, and store
+        // it on the session. The sign-in cookie is only issued to a caller presenting this nonce.
+        var bindingNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        Response.Cookies.Append(BindCookieName, bindingNonce, new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = Request.IsHttps,
+            SameSite = SameSiteMode.Strict,
+            IsEssential = true,
+            MaxAge = TimeSpan.FromMinutes(10)
+        });
+
+        var session = await _nostrLoginService.CreateSessionAsync(
+            Nip46SessionPurpose.Login, await GetRelays(), "BTCPay Server",
+            bindingNonce: bindingNonce,
+            rateLimitKey: HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown");
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
     }
@@ -115,7 +143,21 @@ public class UINostrLoginController : Controller
                 return Json(new { status = "failed", error = session.Error });
         }
 
-        // Approved
+        // Approved. M2: enforce browser-origin binding before issuing any cookie.
+        var presentedNonce = Request.Cookies[BindCookieName];
+        if (session.BindingNonce is not null &&
+            !CryptographicOperations.FixedTimeEquals(
+                System.Text.Encoding.ASCII.GetBytes(presentedNonce ?? ""),
+                System.Text.Encoding.ASCII.GetBytes(session.BindingNonce)))
+        {
+            _nostrLoginService.RemoveSession(session.Id);
+            return Json(new
+            {
+                status = "failed",
+                error = "Please complete this sign-in in the same browser that displayed the QR code."
+            });
+        }
+
         var pubkey = session.UserPubkey!;
         var user = await FindUserByPubkey(pubkey);
         if (user is null)
@@ -145,6 +187,7 @@ public class UINostrLoginController : Controller
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         _nostrLoginService.RemoveSession(session.Id); // single use, removed only after success
+        Response.Cookies.Delete(BindCookieName);
         var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
         return Json(new { status = "approved", redirect });
     }

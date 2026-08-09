@@ -21,7 +21,10 @@ Early MVP / proof of concept. Validates that a BTCPay plugin can own a complete 
 - [x] Server settings page at `/server/nostr-login` (admin only): toggle account creation via Nostr, configure relays
 - [x] Account creation via Nostr (off by default) honors the server's registration policies: disabled registration, required email confirmation, and admin approval
 
-Deliberately out of scope for now: session-to-origin binding hardening (anti-QRLjacking) and rate limiting on session creation (BTCPay core applies none to `/login` either).
+Security hardening (v0.4.0):
+- Anti-QRLjacking: each login session is bound to the browser that rendered the QR via an HttpOnly, SameSite=Strict cookie; the sign-in cookie is only issued to that browser.
+- Rate limiting: anonymous login-session creation is throttled per IP (10/minute).
+- Ephemeral per-session keys are zeroized and disposed the moment the flow resolves.
 
 Deliberately out of scope for the MVP: disabling password login and any subscription/LN-address gating.
 

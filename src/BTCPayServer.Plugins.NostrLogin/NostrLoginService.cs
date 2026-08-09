@@ -47,6 +47,13 @@ public class Nip46Session
 
     public string? Error { get; internal set; }
 
+    /// <summary>
+    /// Random nonce bound to the browser that created a Login session (M2, anti-QRLjacking).
+    /// The sign-in cookie is only issued when the caller presents a matching bind cookie.
+    /// Null for Link sessions (already authenticated + CSRF-bound to the user).
+    /// </summary>
+    public string? BindingNonce { get; init; }
+
     internal CancellationTokenSource Cts { get; } = new();
 }
 
@@ -65,7 +72,12 @@ public class NostrLoginService : IDisposable
     private static readonly TimeSpan RelayConnectTimeout = TimeSpan.FromSeconds(15);
     private const int SignedEventMaxAgeMinutes = 10;
 
+    // M3: throttle anonymous login-session creation to bound relay connections / background tasks.
+    private static readonly TimeSpan RateLimitWindow = TimeSpan.FromMinutes(1);
+    private const int MaxLoginSessionsPerWindow = 10;
+
     private readonly ConcurrentDictionary<string, Nip46Session> _sessions = new();
+    private readonly ConcurrentDictionary<string, (int Count, DateTimeOffset WindowStart)> _rateLimit = new();
     private readonly ILogger<NostrLoginService> _logger;
 
     public NostrLoginService(ILogger<NostrLoginService> logger)
@@ -73,9 +85,43 @@ public class NostrLoginService : IDisposable
         _logger = logger;
     }
 
-    public async Task<Nip46Session> CreateSessionAsync(Nip46SessionPurpose purpose, string[] relays, string appName, string? linkUserId = null)
+    /// <summary>
+    /// Returns true if a new login session is allowed for this rate-limit key (typically the
+    /// client IP), and records the attempt. Link sessions (authenticated) are not rate limited.
+    /// </summary>
+    private bool AllowLoginAttempt(string rateLimitKey)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var updated = _rateLimit.AddOrUpdate(
+            rateLimitKey,
+            _ => (1, now),
+            (_, current) => now - current.WindowStart > RateLimitWindow
+                ? (1, now)
+                : (current.Count + 1, current.WindowStart));
+        return updated.Count <= MaxLoginSessionsPerWindow;
+    }
+
+    public async Task<Nip46Session> CreateSessionAsync(Nip46SessionPurpose purpose, string[] relays, string appName,
+        string? linkUserId = null, string? bindingNonce = null, string? rateLimitKey = null)
     {
         Cleanup();
+
+        // M3: only throttle anonymous login sessions; link sessions are already authenticated.
+        if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null && !AllowLoginAttempt(rateLimitKey))
+        {
+            var rejected = new Nip46Session
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Purpose = purpose,
+                ConnectUri = "",
+                Status = Nip46SessionStatus.Failed,
+                Error = "Too many sign-in attempts. Please wait a moment and reload the page."
+            };
+            // Register it so the status poller surfaces the real reason rather than "expired".
+            _sessions[rejected.Id] = rejected;
+            return rejected;
+        }
+
         if (relays.Length == 0)
             relays = DefaultRelays;
 
@@ -94,7 +140,8 @@ public class NostrLoginService : IDisposable
             Id = Guid.NewGuid().ToString("N"),
             Purpose = purpose,
             LinkUserId = linkUserId,
-            ConnectUri = connectUri
+            ConnectUri = connectUri,
+            BindingNonce = bindingNonce
         };
         _sessions[session.Id] = session;
         session.Cts.CancelAfter(SessionLifetime);
@@ -122,7 +169,7 @@ public class NostrLoginService : IDisposable
         if (clients.Count == 0)
         {
             Fail(session, "Could not connect to any nostr relay.");
-            clientKey.Dispose();
+            ZeroizeAndDispose(clientKey);
             return session;
         }
 
@@ -176,11 +223,35 @@ public class NostrLoginService : IDisposable
                     {
                     }
                 }
-                clientKey.Dispose();
+                // M1: ProcessAsync returns immediately on any terminal state (approved /
+                // failed / timeout / exception), so the ephemeral key is wiped and disposed
+                // promptly on resolution rather than lingering until the stale-session sweep.
+                ZeroizeAndDispose(clientKey);
             }
         });
 
         return session;
+    }
+
+    /// <summary>
+    /// Overwrites the private key bytes before disposing. Dispose alone frees the handle but
+    /// does not guarantee the 32-byte secret is cleared from memory (M1 defense-in-depth).
+    /// </summary>
+    private static void ZeroizeAndDispose(ECPrivKey key)
+    {
+        try
+        {
+            Span<byte> scratch = stackalloc byte[32];
+            key.WriteToSpan(scratch);
+            scratch.Clear();
+        }
+        catch (Exception)
+        {
+        }
+        finally
+        {
+            key.Dispose();
+        }
     }
 
     public Nip46Session? GetSession(string id) => _sessions.GetValueOrDefault(id);
@@ -202,11 +273,21 @@ public class NostrLoginService : IDisposable
 
     private void Cleanup()
     {
-        var cutoff = DateTimeOffset.UtcNow - SessionLifetime - TimeSpan.FromMinutes(5);
+        var now = DateTimeOffset.UtcNow;
+        var cutoff = now - SessionLifetime - TimeSpan.FromMinutes(5);
         foreach (var (id, session) in _sessions)
             if (session.CreatedAt < cutoff)
                 RemoveSession(id);
+
+        // Sweep stale rate-limit windows so the dictionary cannot grow unbounded.
+        foreach (var (key, window) in _rateLimit)
+            if (now - window.WindowStart > RateLimitWindow)
+                _rateLimit.TryRemove(key, out _);
     }
+
+    // Exposed for unit tests.
+    internal bool AllowLoginAttemptForTest(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
+    internal static int MaxLoginSessionsPerWindowForTest => MaxLoginSessionsPerWindow;
 
     private class Nip46Rpc
     {
