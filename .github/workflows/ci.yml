@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build plugin
+        run: dotnet build src/BTCPayServer.Plugins.NostrLogin/BTCPayServer.Plugins.NostrLogin.csproj -c Release
+
+      - name: Run tests
+        # The test project is an xUnit v3 executable; run it directly.
+        # Nip46FlowTests reaches public relays; keep as-is for the smoke check.
+        run: dotnet run --project tests/BTCPayServer.Plugins.NostrLogin.Tests -c Release

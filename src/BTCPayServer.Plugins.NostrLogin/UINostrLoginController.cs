@@ -146,9 +146,7 @@ public class UINostrLoginController : Controller
         // Approved. M2: enforce browser-origin binding before issuing any cookie.
         var presentedNonce = Request.Cookies[BindCookieName];
         if (session.BindingNonce is not null &&
-            !CryptographicOperations.FixedTimeEquals(
-                System.Text.Encoding.ASCII.GetBytes(presentedNonce ?? ""),
-                System.Text.Encoding.ASCII.GetBytes(session.BindingNonce)))
+            !NostrLoginService.BindingNonceMatches(session.BindingNonce, presentedNonce))
         {
             _nostrLoginService.RemoveSession(session.Id);
             return Json(new

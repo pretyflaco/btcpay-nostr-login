@@ -129,11 +129,7 @@ public class NostrLoginService : IDisposable
         var clientPubkey = clientKey.CreateXOnlyPubKey().ToHex();
         var secret = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
 
-        var relayParams = string.Join("&", relays.Select(r => "relay=" + Uri.EscapeDataString(r)));
-        var connectUri =
-            $"nostrconnect://{clientPubkey}?{relayParams}&secret={secret}" +
-            $"&perms={Uri.EscapeDataString("sign_event:22242")}" +
-            $"&name={Uri.EscapeDataString(appName)}";
+        var connectUri = BuildConnectUri(clientPubkey, relays, secret, appName);
 
         var session = new Nip46Session
         {
@@ -289,6 +285,34 @@ public class NostrLoginService : IDisposable
     internal bool AllowLoginAttemptForTest(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
     internal static int MaxLoginSessionsPerWindowForTest => MaxLoginSessionsPerWindow;
 
+    /// <summary>
+    /// Builds the nostrconnect:// URI encoding the ephemeral client pubkey, relays, one-time
+    /// secret, requested permission (sign_event:22242) and app name.
+    /// </summary>
+    internal static string BuildConnectUri(string clientPubkey, string[] relays, string secret, string appName)
+    {
+        var relayParams = string.Join("&", relays.Select(r => "relay=" + Uri.EscapeDataString(r)));
+        return $"nostrconnect://{clientPubkey}?{relayParams}&secret={secret}" +
+               $"&perms={Uri.EscapeDataString("sign_event:22242")}" +
+               $"&name={Uri.EscapeDataString(appName)}";
+    }
+
+    /// <summary>
+    /// Constant-time comparison of the browser-bound nonce (M2). Returns true only when both
+    /// values are present and equal. Handles differing lengths without throwing (unlike a bare
+    /// CryptographicOperations.FixedTimeEquals on mismatched spans).
+    /// </summary>
+    internal static bool BindingNonceMatches(string? expected, string? presented)
+    {
+        if (string.IsNullOrEmpty(expected) || string.IsNullOrEmpty(presented))
+            return false;
+        var a = System.Text.Encoding.ASCII.GetBytes(expected);
+        var b = System.Text.Encoding.ASCII.GetBytes(presented);
+        if (a.Length != b.Length)
+            return false;
+        return CryptographicOperations.FixedTimeEquals(a, b);
+    }
+
     private class Nip46Rpc
     {
         [JsonPropertyName("id")] public string? Id { get; set; }
@@ -427,7 +451,12 @@ public class NostrLoginService : IDisposable
         }
     }
 
-    private static string? ValidateSignedEvent(NostrEvent? signed, string expectedPubkey, string expectedChallenge)
+    /// <summary>
+    /// Validates a signed kind-22242 challenge event. Returns null when valid, otherwise a
+    /// human-readable rejection reason. This is the auth-critical gate — exposed as internal
+    /// so its accept/reject cases can be unit tested.
+    /// </summary>
+    internal static string? ValidateSignedEvent(NostrEvent? signed, string expectedPubkey, string expectedChallenge)
     {
         if (signed is null)
             return "Signer returned an invalid event.";
