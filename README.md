@@ -1,0 +1,44 @@
+# BTCPay Server Nostr Login plugin
+
+Sign in to BTCPay Server with a **NIP-46 Nostr remote signer** (Nostr Connect).
+
+Scan a `nostrconnect://` QR code with a NIP-46 signer app (e.g. [Amber](https://github.com/greenart7c3/Amber) on Android), approve a single `kind:22242` signing request, and you are logged in.
+
+This plugin is **purely additive**: password, Passkey and LoginCode sign-in remain untouched. It adds a third alternative sign-in path served by the plugin at `/login/nostr`.
+
+## Status
+
+Early MVP / proof of concept. Validates that a BTCPay plugin can own a complete alternative login vertical:
+
+- [ ] `/login/nostr` page rendering a `nostrconnect://` QR + URI
+- [ ] NIP-46 relay client: connect ack, `sign_event` request for a kind-22242 challenge, signature verification
+- [ ] npub → BTCPay user linking (account settings), optional auto-create behind a feature flag (off by default)
+- [ ] Standard cookie issuance via `SignInManager`
+
+Deliberately out of scope for the MVP: disabling password login, session-to-origin binding hardening (anti-QRLjacking), and any subscription/LN-address gating.
+
+## Requirements
+
+- BTCPay Server >= 2.4.2
+
+## Development
+
+```bash
+git clone --recurse-submodules https://github.com/pretyflaco/btcpay-nostr-login
+cd btcpay-nostr-login
+dotnet build src/BTCPayServer.Plugins.NostrLogin/BTCPayServer.Plugins.NostrLogin.csproj
+```
+
+Register the plugin with the BTCPay Server development environment:
+
+```bash
+./plugin-register.sh
+cd submodules/btcpayserver/BTCPayServer.Tests
+docker compose up -d dev
+```
+
+Then run BTCPay Server with the `Bitcoin-HTTPS` launch profile; the plugin is loaded via `DEBUG_PLUGINS`.
+
+## License
+
+MIT
