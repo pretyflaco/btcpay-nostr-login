@@ -2,39 +2,79 @@
   <img src="docs/assets/logo-rectangle.png" alt="Nostr Login" width="480" />
 </p>
 
-# BTCPay Server Nostr Login plugin
+# Nostr Login for BTCPay Server
 
-Sign in to BTCPay Server with a **NIP-46 Nostr remote signer** (Nostr Connect).
+This plugin lets users sign in to BTCPay Server with a **NIP-46 Nostr remote signer** (Nostr Connect) — scan a QR code with a signer app such as [Amber](https://github.com/greenart7c3/Amber), approve once, and you are logged in. No password, no email, and the private key never leaves the signer.
 
-Scan a `nostrconnect://` QR code with a NIP-46 signer app (e.g. [Amber](https://github.com/greenart7c3/Amber) on Android), approve a single `kind:22242` signing request, and you are logged in.
+It is **purely additive**: "Sign in with Nostr" appears as a third option next to Passkey and LoginCode, and password sign-in keeps working.
 
-This plugin is **purely additive**: password, Passkey and LoginCode sign-in remain untouched. It adds a third alternative sign-in path served by the plugin at `/login/nostr`.
+## Usage
 
-## Status
+1. Install the plugin by navigating to your BTCPay Server > Server Settings > Plugins, find "Nostr Login" in
+   Available Plugins, install it, and restart your server.
+   a. Nostr Login requires BTCPay Server v2.4.2 or newer.
+   b. The plugin is additive — it does not disable or replace password, Passkey, or LoginCode sign-in.
+2. Link a Nostr key to your account: navigate to Account > Nostr, click "Link a Nostr key", and scan the QR code
+   with a NIP-46 signer app (e.g. Amber). Approve the request to prove possession of the key.
+3. Sign out, then on the login page choose **NostrConnect** (next to Passkey and LoginCode).
+4. A QR code is displayed. Scan it with your signer app and approve the sign-in request. You are logged in — the
+   plugin issues the standard BTCPay session cookie.
+5. Admins can configure the plugin under Server Settings > Nostr Login: set the relays used for sign-in and
+   optionally allow account creation via Nostr sign-in.
 
-Early MVP / proof of concept. Validates that a BTCPay plugin can own a complete alternative login vertical:
+## How it works
 
-- [x] `/login/nostr` page rendering a `nostrconnect://` QR + URI
-- [x] NIP-46 relay client: connect ack, `get_public_key`, `sign_event` request for a kind-22242 challenge, signature verification (NIP-44 with NIP-04 fallback)
-- [x] npub → BTCPay user linking at `/account/nostr` (proof of possession via the same NIP-46 flow), optional auto-create behind a feature flag (off by default)
-- [x] Standard cookie issuance via `SignInManager` after the core `CanLogin` policy checks
-- [x] End-to-end validated against public relays (see `tools/FakeSigner`, a minimal NIP-46 signer CLI for development)
-- [x] End-to-end validated with Amber (Android)
-- [x] "NostrConnect" button on the core `/login` page, next to Passkey and LoginCode (injected via a response-rewriting startup filter, since `Login.cshtml` has no UI extension point; degrades gracefully if the markup anchor is not found)
-- [x] CSRF protection on all state-changing endpoints (controller follows the `UI*` naming convention required by BTCPay's global antiforgery filter)
-- [x] Server settings page at `/server/nostr-login` (admin only): toggle account creation via Nostr, configure relays
-- [x] Account creation via Nostr (off by default) honors the server's registration policies: disabled registration, required email confirmation, and admin approval
+Nostr Login implements the [NIP-46 (Nostr Connect)](https://github.com/nostr-protocol/nips/blob/master/46.md) remote-signing flow. When a user starts sign-in, the plugin generates an ephemeral client key and displays a `nostrconnect://` URI as a QR code:
 
-Security hardening (v0.4.0):
-- Anti-QRLjacking: each login session is bound to the browser that rendered the QR via an HttpOnly, SameSite=Strict cookie; the sign-in cookie is only issued to that browser.
-- Rate limiting: anonymous login-session creation is throttled per IP (10/minute).
-- Ephemeral per-session keys are zeroized and disposed the moment the flow resolves.
+`nostrconnect://<client-pubkey>?relay=wss://nos.lol&relay=wss://relay.primal.net&secret=<secret>&perms=sign_event:22242&name=BTCPay%20Server`
 
-Deliberately out of scope for the MVP: disabling password login and any subscription/LN-address gating.
+The signer app connects over the listed relays (NIP-46 messages are exchanged as encrypted `kind:24133` events, NIP-44 with a NIP-04 fallback) and the flow proceeds:
 
-## Requirements
+1. **Connect** — the signer acknowledges by echoing the one-time `secret`.
+2. **get_public_key** — the plugin requests the user's public key.
+3. **sign_event** — the plugin asks the signer to sign a fresh `kind:22242` challenge event:
 
-- BTCPay Server >= 2.4.2
+```json
+{
+  "kind": 22242,
+  "created_at": 1723200000,
+  "content": "BTCPay Server sign-in challenge: <random-challenge>",
+  "tags": [["challenge", "<random-challenge>"]]
+}
+```
+
+The plugin then verifies the returned event: correct kind, the pubkey matches the signer's user pubkey, the `challenge` tag matches, the timestamp is fresh, and the Schnorr signature is valid. Only then is the session cookie issued — after the same `CanLogin` policy checks BTCPay applies to every login.
+
+## Routes
+
+All routes are cookie-authenticated MVC endpoints. **This version does not expose a Greenfield/REST API.**
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/login/nostr` | GET | Sign-in page: renders the Nostr Connect QR and polls for approval. |
+| `/login/nostr/status/{sessionId}` | GET | Poll endpoint returning `pending` / `approved` / `failed`. |
+| `/account/nostr` | GET | Manage linked Nostr keys for the current account. |
+| `/account/nostr/link` | POST | Start a link session (proof of possession via NIP-46). |
+| `/account/nostr/unlink` | POST | Remove a linked key. |
+| `/server/nostr-login` | GET/POST | Admin settings: relays and account-creation toggle (requires `CanModifyServerSettings`). |
+
+The "NostrConnect" button on the core login page is injected by a startup filter, because BTCPay's `Login.cshtml` has no UI extension point. It degrades gracefully — if the expected markup is not found, the login page is served unchanged.
+
+## Compatible signers
+
+Any NIP-46 signer that can sign a `kind:22242` event works. Tested with:
+
+* **Amber** (Android): ([github.com/greenart7c3/Amber](https://github.com/greenart7c3/Amber))
+    * [F-Droid](https://f-droid.org/packages/com.greenart7c3.nostrsigner/)
+    * Also available via the Google Play Store and Obtainium.
+
+## Security
+
+* **Anti-QRLjacking** — each login session is bound to the browser that rendered the QR via an HttpOnly, `SameSite=Strict` cookie; the session cookie is only issued to that browser.
+* **Rate limiting** — anonymous sign-in session creation is throttled per IP (10/minute).
+* **Key hygiene** — ephemeral per-session keys are zeroized and disposed the moment the flow resolves.
+* **CSRF** — all state-changing endpoints are protected by BTCPay's global antiforgery filter.
+* **Policy-aware account creation** — creation via Nostr is off by default, and when enabled still honors the server's registration policies (disabled registration, required email confirmation, and admin approval).
 
 ## Development
 
@@ -44,7 +84,7 @@ cd btcpay-nostr-login
 dotnet build src/BTCPayServer.Plugins.NostrLogin/BTCPayServer.Plugins.NostrLogin.csproj
 ```
 
-Register the plugin with the BTCPay Server development environment:
+Register the plugin with the BTCPay Server development environment and start its dependencies:
 
 ```bash
 ./plugin-register.sh
@@ -54,6 +94,8 @@ docker compose up -d dev
 
 Then run BTCPay Server with the `Bitcoin-HTTPS` launch profile; the plugin is loaded via `DEBUG_PLUGINS`.
 
+`tools/FakeSigner` is a minimal NIP-46 signer CLI used to drive the sign-in flow end-to-end in development without a phone.
+
 ## License
 
-MIT
+[MIT](https://github.com/pretyflaco/btcpay-nostr-login/blob/main/LICENSE)
