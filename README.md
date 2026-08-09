@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo-rectangle.png" alt="Nostr Login" width="480" />
+</p>
+
 # BTCPay Server Nostr Login plugin
 
 Sign in to BTCPay Server with a **NIP-46 Nostr remote signer** (Nostr Connect).
