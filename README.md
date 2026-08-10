@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo-rectangle.png" alt="Nostr Login" width="480" />
+  <img src="docs/assets/nostr-key-rectangle.png" alt="Nostr Login" width="480" />
 </p>
 
 # Nostr Login for BTCPay Server
