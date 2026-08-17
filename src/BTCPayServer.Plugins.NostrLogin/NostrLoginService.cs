@@ -180,6 +180,12 @@ public class NostrLoginService : IDisposable
                 ReferencedPublicKeys = [clientPubkey]
             }
         };
+        // DIAG (this instance only — do NOT ship publicly): surface the handshake start on the
+        // server log so a signer that never completes can be triaged (the failure path is
+        // otherwise Debug-only / browser-only).
+        _logger.LogInformation(
+            "NostrLogin DIAG session {SessionId}: listening on {RelayCount} relay(s) [{Relays}] for #p={ClientPubkey}",
+            session.Id, clients.Count, string.Join(", ", relays), clientPubkey);
         foreach (var relayClient in clients)
         {
             relayClient.EventsReceived += (_, args) =>
@@ -258,12 +264,15 @@ public class NostrLoginService : IDisposable
             session.Cts.Cancel();
     }
 
-    private static void Fail(Nip46Session session, string error)
+    private void Fail(Nip46Session session, string error)
     {
         if (session.Status == Nip46SessionStatus.Pending)
         {
             session.Status = Nip46SessionStatus.Failed;
             session.Error = error;
+            // DIAG (this instance only): the failure reason is otherwise browser-only. Surface it
+            // on the server log so a stuck handshake can be triaged post-hoc.
+            _logger.LogInformation("NostrLogin DIAG session {SessionId}: FAILED — {Error}", session.Id, error);
         }
     }
 
@@ -363,7 +372,9 @@ public class NostrLoginService : IDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "NostrLogin session {SessionId}: could not decrypt event {EventId}", session.Id, evt.Id);
+                // DIAG (this instance only): promoted to Info so a decrypt mismatch (wrong
+                // conversation key / scheme) is visible on the server log, not just Debug.
+                _logger.LogInformation(ex, "NostrLogin DIAG session {SessionId}: could not decrypt event {EventId} from {Pubkey}", session.Id, evt.Id, evt.PublicKey);
                 continue;
             }
             if (msg is null)
@@ -376,6 +387,8 @@ public class NostrLoginService : IDisposable
                 {
                     signerPubkey = evt.PublicKey;
                     useNip04 = msgWasNip04;
+                    // DIAG (this instance only): milestone log — the handshake reached ack.
+                    _logger.LogInformation("NostrLogin DIAG session {SessionId}: ACK accepted from {Pubkey}, sending get_public_key (nip04={Nip04})", session.Id, signerPubkey, useNip04);
                     getPubkeyRequestId = await SendRequest(Publish, clientKey, clientPubkey, signerPubkey,
                         "get_public_key", [], useNip04);
                 }
