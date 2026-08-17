@@ -40,6 +40,9 @@ public class NostrLoginServerSettingsViewModel
     /// <summary>One relay URL per line; empty means the built-in defaults.</summary>
     public string? Relays { get; set; }
 
+    /// <summary>Verbose NIP-46 handshake logging; off by default, for debugging a stuck signer.</summary>
+    public bool EnableDiagnosticLogging { get; set; }
+
     public int LinkedKeyCount { get; set; }
     public string[] DefaultRelays { get; set; } = [];
 }
@@ -77,6 +80,19 @@ public class UINostrLoginController : Controller
         var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
         return settings.Relays is { Count: > 0 } ? settings.Relays.ToArray() : NostrLoginService.DefaultRelays;
     }
+
+    private async Task<bool> GetDiagnosticsEnabled()
+    {
+        var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
+        return settings.EnableDiagnosticLogging;
+    }
+
+    /// <summary>This instance's base URL, advertised to the signer so multiple BTCPay instances
+    /// are distinguishable (they otherwise all show the same generic name).</summary>
+    private string InstanceUrl() => $"{Request.Scheme}://{Request.Host}";
+
+    /// <summary>App name shown by the signer, suffixed with the host so instances can be told apart.</summary>
+    private string InstanceAppName() => $"BTCPay Server ({Request.Host})";
 
     private NostrLoginViewModel ToViewModel(Nip46Session session, string statusUrl, string? returnUrl = null)
     {
@@ -120,9 +136,11 @@ public class UINostrLoginController : Controller
         });
 
         var session = await _nostrLoginService.CreateSessionAsync(
-            Nip46SessionPurpose.Login, await GetRelays(), "BTCPay Server",
+            Nip46SessionPurpose.Login, await GetRelays(), InstanceAppName(),
             bindingNonce: bindingNonce,
-            rateLimitKey: HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown");
+            rateLimitKey: HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
+            diagnostics: await GetDiagnosticsEnabled());
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
     }
@@ -225,7 +243,10 @@ public class UINostrLoginController : Controller
         var user = await _userManager.GetUserAsync(User);
         if (user is null)
             return NotFound();
-        var session = await _nostrLoginService.CreateSessionAsync(Nip46SessionPurpose.Link, await GetRelays(), "BTCPay Server", user.Id);
+        var session = await _nostrLoginService.CreateSessionAsync(
+            Nip46SessionPurpose.Link, await GetRelays(), InstanceAppName(), user.Id,
+            appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
+            diagnostics: await GetDiagnosticsEnabled());
         return RedirectToAction(nameof(Account), new { linkSession = session.Id });
     }
 
@@ -285,6 +306,7 @@ public class UINostrLoginController : Controller
         {
             AllowAutoUserCreation = settings.AllowAutoUserCreation,
             Relays = settings.Relays is { Count: > 0 } ? string.Join("\n", settings.Relays) : "",
+            EnableDiagnosticLogging = settings.EnableDiagnosticLogging,
             LinkedKeyCount = (await GetUserMap()).PubkeyToUserId.Count,
             DefaultRelays = NostrLoginService.DefaultRelays
         });
@@ -312,6 +334,7 @@ public class UINostrLoginController : Controller
         var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
         settings.AllowAutoUserCreation = model.AllowAutoUserCreation;
         settings.Relays = relays.Count > 0 ? relays : null;
+        settings.EnableDiagnosticLogging = model.EnableDiagnosticLogging;
         await _settingsRepository.UpdateSetting(settings);
         TempData[BTCPayServer.Abstractions.Constants.WellKnownTempData.SuccessMessage] = "Nostr Login settings updated.";
         return RedirectToAction(nameof(ServerSettings));

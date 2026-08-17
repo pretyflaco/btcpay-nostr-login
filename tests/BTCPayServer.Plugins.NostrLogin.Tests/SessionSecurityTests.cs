@@ -58,6 +58,56 @@ public class ConnectUriTests
         Assert.Equal("sign_event:22242", query["perms"]);
         Assert.Equal("BTCPay Server", query["name"]);
     }
+
+    [Fact]
+    public void OmitsUrlAndImageWhenNotProvided()
+    {
+        var uri = NostrLoginService.BuildConnectUri("abc123", ["wss://nos.lol"], "deadbeef", "BTCPay Server");
+        var query = HttpUtility.ParseQueryString(new Uri(uri).Query);
+        Assert.Null(query["url"]);
+        Assert.Null(query["image"]);
+    }
+
+    [Fact]
+    public void EncodesUrlAndImageWhenProvided()
+    {
+        // NIP-46 url/image so the signer shows a recognisable avatar and can tell instances apart.
+        var uri = NostrLoginService.BuildConnectUri(
+            "abc123",
+            ["wss://nos.lol"],
+            "deadbeef",
+            "BTCPay Server (btcpay.example.org)",
+            appUrl: "https://btcpay.example.org",
+            imageUrl: "https://avatars.example.com/logo.png");
+
+        var query = HttpUtility.ParseQueryString(new Uri(uri).Query);
+        Assert.Equal("BTCPay Server (btcpay.example.org)", query["name"]);
+        Assert.Equal("https://btcpay.example.org", query["url"]);
+        Assert.Equal("https://avatars.example.com/logo.png", query["image"]);
+    }
+}
+
+public class NonBlockingSessionTests
+{
+    [Fact]
+    public async Task ReturnsPromptlyWithConnectUriEvenWhenRelaysUnreachable()
+    {
+        // The QR-rendering request must never block on relay connectivity: a dead relay used to
+        // hang /login/nostr for the full per-relay timeout. Session creation is now synchronous;
+        // all relay work happens on a background task.
+        var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
+        var unreachable = new[] { "wss://10.255.255.1:9", "wss://192.0.2.1:9" };
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var session = await service.CreateSessionAsync(Nip46SessionPurpose.Login, unreachable, "BTCPay Server");
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2),
+            $"CreateSessionAsync should return promptly, took {sw.Elapsed.TotalSeconds:0.00}s");
+        Assert.False(string.IsNullOrEmpty(session.ConnectUri));
+        Assert.StartsWith("nostrconnect://", session.ConnectUri);
+        Assert.Equal(Nip46SessionStatus.Pending, session.Status);
+    }
 }
 
 public class RateLimitedSessionTests

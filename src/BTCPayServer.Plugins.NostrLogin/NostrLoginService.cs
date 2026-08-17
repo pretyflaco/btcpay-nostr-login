@@ -67,9 +67,24 @@ public class Nip46Session
 /// </summary>
 public class NostrLoginService : IDisposable
 {
-    public static readonly string[] DefaultRelays = ["wss://nos.lol", "wss://relay.primal.net"];
+    public static readonly string[] DefaultRelays =
+    [
+        "wss://nos.lol",
+        "wss://relay.damus.io",
+        "wss://relay.primal.net",
+        "wss://offchain.pub"
+    ];
+
+    /// <summary>
+    /// Image advertised to the signer via the nostrconnect:// <c>image</c> param (NIP-46), shown
+    /// as the service avatar so users recognise what they are connecting to.
+    /// </summary>
+    public const string DefaultImageUrl = "https://avatars.githubusercontent.com/u/31132886?s=200&v=4";
+
     private static readonly TimeSpan SessionLifetime = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan RelayConnectTimeout = TimeSpan.FromSeconds(15);
+    // Per-relay connect timeout. Kept short: connecting now happens off the request thread (the QR
+    // renders immediately), but a shorter cap still bounds how long a dead relay lingers.
+    private static readonly TimeSpan RelayConnectTimeout = TimeSpan.FromSeconds(5);
     private const int SignedEventMaxAgeMinutes = 10;
 
     // M3: throttle anonymous login-session creation to bound relay connections / background tasks.
@@ -101,8 +116,15 @@ public class NostrLoginService : IDisposable
         return updated.Count <= MaxLoginSessionsPerWindow;
     }
 
-    public async Task<Nip46Session> CreateSessionAsync(Nip46SessionPurpose purpose, string[] relays, string appName,
-        string? linkUserId = null, string? bindingNonce = null, string? rateLimitKey = null)
+    /// <summary>
+    /// Creates a NIP-46 session and returns immediately with a ready-to-render nostrconnect:// URI.
+    /// Relay connection, subscription and the RPC flow all run on a background task so the HTTP
+    /// request rendering the QR never blocks on relay connectivity (a slow/dead relay used to hang
+    /// the login request for up to the per-relay timeout, spinning the browser tab).
+    /// </summary>
+    public Task<Nip46Session> CreateSessionAsync(Nip46SessionPurpose purpose, string[] relays, string appName,
+        string? linkUserId = null, string? bindingNonce = null, string? rateLimitKey = null,
+        string? appUrl = null, string? imageUrl = null, bool diagnostics = false)
     {
         Cleanup();
 
@@ -119,7 +141,7 @@ public class NostrLoginService : IDisposable
             };
             // Register it so the status poller surfaces the real reason rather than "expired".
             _sessions[rejected.Id] = rejected;
-            return rejected;
+            return Task.FromResult(rejected);
         }
 
         if (relays.Length == 0)
@@ -129,7 +151,7 @@ public class NostrLoginService : IDisposable
         var clientPubkey = clientKey.CreateXOnlyPubKey().ToHex();
         var secret = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
 
-        var connectUri = BuildConnectUri(clientPubkey, relays, secret, appName);
+        var connectUri = BuildConnectUri(clientPubkey, relays, secret, appName, appUrl, imageUrl);
 
         var session = new Nip46Session
         {
@@ -141,98 +163,115 @@ public class NostrLoginService : IDisposable
         };
         _sessions[session.Id] = session;
         session.Cts.CancelAfter(SessionLifetime);
+
+        // Everything relay-related runs off the request thread. The QR is returned synchronously
+        // below; by the time a human scans it (seconds later) the background connect has completed.
+        _ = Task.Run(() => RunSessionAsync(session, clientKey, clientPubkey, secret, relays, diagnostics));
+
+        return Task.FromResult(session);
+    }
+
+    /// <summary>
+    /// Background driver: connects to the relays (in parallel), subscribes, and runs the RPC flow.
+    /// Isolated from <see cref="CreateSessionAsync"/> so the request thread never waits on relays.
+    /// </summary>
+    private async Task RunSessionAsync(Nip46Session session, ECPrivKey clientKey, string clientPubkey,
+        string secret, string[] relays, bool diagnostics)
+    {
         var ct = session.Cts.Token;
-
-        // Connect per relay and tolerate partial failures: one dead relay must not kill the session.
         var clients = new List<NostrClient>();
-        foreach (var relay in relays)
+        try
         {
-            var relayClient = new NostrClient(new Uri(relay));
-            try
+            // Connect to all relays in parallel and tolerate partial failures: one dead relay must
+            // neither kill the session nor delay the others (previously connects were sequential,
+            // so a single slow relay added its full timeout to the total).
+            var connectTasks = relays.Select(async relay =>
             {
-                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                connectCts.CancelAfter(RelayConnectTimeout);
-                await relayClient.ConnectAndWaitUntilConnected(connectCts.Token, ct);
-                clients.Add(relayClient);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning("NostrLogin session {SessionId}: could not connect to relay {Relay}: {Error}",
-                    session.Id, relay, ex.Message);
-                relayClient.Dispose();
-            }
-        }
-        if (clients.Count == 0)
-        {
-            Fail(session, "Could not connect to any nostr relay.");
-            ZeroizeAndDispose(clientKey);
-            return session;
-        }
-
-        // Subscribe before handing out the QR: the connect ack is sent exactly once.
-        var events = Channel.CreateUnbounded<NostrEvent>();
-        var subscriptionId = Guid.NewGuid().ToString("N");
-        var filters = new[]
-        {
-            new NostrSubscriptionFilter
-            {
-                Kinds = [24133],
-                ReferencedPublicKeys = [clientPubkey]
-            }
-        };
-        // DIAG (this instance only — do NOT ship publicly): surface the handshake start on the
-        // server log so a signer that never completes can be triaged (the failure path is
-        // otherwise Debug-only / browser-only).
-        _logger.LogInformation(
-            "NostrLogin DIAG session {SessionId}: listening on {RelayCount} relay(s) [{Relays}] for #p={ClientPubkey}",
-            session.Id, clients.Count, string.Join(", ", relays), clientPubkey);
-        foreach (var relayClient in clients)
-        {
-            relayClient.EventsReceived += (_, args) =>
-            {
-                if (args.subscriptionId != subscriptionId)
-                    return;
-                foreach (var evt in args.events)
-                    events.Writer.TryWrite(evt);
-            };
-            await relayClient.CreateSubscription(subscriptionId, filters, ct);
-        }
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await ProcessAsync(session, clientKey, clientPubkey, secret, clients, events, ct);
-            }
-            catch (OperationCanceledException)
-            {
-                Fail(session, "Timed out waiting for signer approval.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "NostrLogin session {SessionId} failed", session.Id);
-                Fail(session, "Unexpected error: " + ex.Message);
-            }
-            finally
-            {
-                foreach (var relayClient in clients)
+                var relayClient = new NostrClient(new Uri(relay));
+                try
                 {
-                    try
-                    {
-                        relayClient.Dispose();
-                    }
-                    catch (Exception)
-                    {
-                    }
+                    using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    connectCts.CancelAfter(RelayConnectTimeout);
+                    await relayClient.ConnectAndWaitUntilConnected(connectCts.Token, ct);
+                    return relayClient;
                 }
-                // M1: ProcessAsync returns immediately on any terminal state (approved /
-                // failed / timeout / exception), so the ephemeral key is wiped and disposed
-                // promptly on resolution rather than lingering until the stale-session sweep.
-                ZeroizeAndDispose(clientKey);
-            }
-        });
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("NostrLogin session {SessionId}: could not connect to relay {Relay}: {Error}",
+                        session.Id, relay, ex.Message);
+                    relayClient.Dispose();
+                    return null;
+                }
+            }).ToList();
 
-        return session;
+            foreach (var connected in await Task.WhenAll(connectTasks))
+                if (connected is not null)
+                    clients.Add(connected);
+
+            if (clients.Count == 0)
+            {
+                Fail(session, "Could not connect to any nostr relay.", diagnostics);
+                return;
+            }
+
+            // Subscribe before we start reading: the connect ack is sent exactly once.
+            var events = Channel.CreateUnbounded<NostrEvent>();
+            var subscriptionId = Guid.NewGuid().ToString("N");
+            var filters = new[]
+            {
+                new NostrSubscriptionFilter
+                {
+                    Kinds = [24133],
+                    ReferencedPublicKeys = [clientPubkey]
+                }
+            };
+            // DIAG (off by default; toggle via admin "Enable diagnostic logging"): surface the
+            // handshake start so a signer that never completes can be triaged (the failure path is
+            // otherwise Debug-only / browser-only).
+            if (diagnostics)
+                _logger.LogInformation(
+                    "NostrLogin DIAG session {SessionId}: listening on {RelayCount} relay(s) [{Relays}] for #p={ClientPubkey}",
+                    session.Id, clients.Count, string.Join(", ", relays), clientPubkey);
+            foreach (var relayClient in clients)
+            {
+                relayClient.EventsReceived += (_, args) =>
+                {
+                    if (args.subscriptionId != subscriptionId)
+                        return;
+                    foreach (var evt in args.events)
+                        events.Writer.TryWrite(evt);
+                };
+                await relayClient.CreateSubscription(subscriptionId, filters, ct);
+            }
+
+            await ProcessAsync(session, clientKey, clientPubkey, secret, clients, events, ct, diagnostics);
+        }
+        catch (OperationCanceledException)
+        {
+            Fail(session, "Timed out waiting for signer approval.", diagnostics);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "NostrLogin session {SessionId} failed", session.Id);
+            Fail(session, "Unexpected error: " + ex.Message, diagnostics);
+        }
+        finally
+        {
+            foreach (var relayClient in clients)
+            {
+                try
+                {
+                    relayClient.Dispose();
+                }
+                catch (Exception)
+                {
+                }
+            }
+            // M1: ProcessAsync returns immediately on any terminal state (approved / failed /
+            // timeout / exception), so the ephemeral key is wiped and disposed promptly on
+            // resolution rather than lingering until the stale-session sweep.
+            ZeroizeAndDispose(clientKey);
+        }
     }
 
     /// <summary>
@@ -264,15 +303,16 @@ public class NostrLoginService : IDisposable
             session.Cts.Cancel();
     }
 
-    private void Fail(Nip46Session session, string error)
+    private void Fail(Nip46Session session, string error, bool diagnostics = false)
     {
         if (session.Status == Nip46SessionStatus.Pending)
         {
             session.Status = Nip46SessionStatus.Failed;
             session.Error = error;
-            // DIAG (this instance only): the failure reason is otherwise browser-only. Surface it
-            // on the server log so a stuck handshake can be triaged post-hoc.
-            _logger.LogInformation("NostrLogin DIAG session {SessionId}: FAILED — {Error}", session.Id, error);
+            // DIAG (off by default; toggle via admin "Enable diagnostic logging"): the failure
+            // reason is otherwise browser-only. Surface it so a stuck handshake can be triaged.
+            if (diagnostics)
+                _logger.LogInformation("NostrLogin DIAG session {SessionId}: FAILED — {Error}", session.Id, error);
         }
     }
 
@@ -296,14 +336,22 @@ public class NostrLoginService : IDisposable
 
     /// <summary>
     /// Builds the nostrconnect:// URI encoding the ephemeral client pubkey, relays, one-time
-    /// secret, requested permission (sign_event:22242) and app name.
+    /// secret, requested permission (sign_event:22242), app name and — when provided — the
+    /// instance URL and service image (NIP-46 <c>url</c>/<c>image</c> params) so the signer can
+    /// show a recognisable avatar and tell instances apart.
     /// </summary>
-    internal static string BuildConnectUri(string clientPubkey, string[] relays, string secret, string appName)
+    internal static string BuildConnectUri(string clientPubkey, string[] relays, string secret, string appName,
+        string? appUrl = null, string? imageUrl = null)
     {
         var relayParams = string.Join("&", relays.Select(r => "relay=" + Uri.EscapeDataString(r)));
-        return $"nostrconnect://{clientPubkey}?{relayParams}&secret={secret}" +
-               $"&perms={Uri.EscapeDataString("sign_event:22242")}" +
-               $"&name={Uri.EscapeDataString(appName)}";
+        var uri = $"nostrconnect://{clientPubkey}?{relayParams}&secret={secret}" +
+                  $"&perms={Uri.EscapeDataString("sign_event:22242")}" +
+                  $"&name={Uri.EscapeDataString(appName)}";
+        if (!string.IsNullOrEmpty(appUrl))
+            uri += $"&url={Uri.EscapeDataString(appUrl)}";
+        if (!string.IsNullOrEmpty(imageUrl))
+            uri += $"&image={Uri.EscapeDataString(imageUrl)}";
+        return uri;
     }
 
     /// <summary>
@@ -332,7 +380,8 @@ public class NostrLoginService : IDisposable
     }
 
     private async Task ProcessAsync(Nip46Session session, ECPrivKey clientKey, string clientPubkey,
-        string secret, List<NostrClient> clients, Channel<NostrEvent> events, CancellationToken ct)
+        string secret, List<NostrClient> clients, Channel<NostrEvent> events, CancellationToken ct,
+        bool diagnostics)
     {
         async Task Publish(NostrEvent evt)
         {
@@ -372,9 +421,11 @@ public class NostrLoginService : IDisposable
             }
             catch (Exception ex)
             {
-                // DIAG (this instance only): promoted to Info so a decrypt mismatch (wrong
-                // conversation key / scheme) is visible on the server log, not just Debug.
-                _logger.LogInformation(ex, "NostrLogin DIAG session {SessionId}: could not decrypt event {EventId} from {Pubkey}", session.Id, evt.Id, evt.PublicKey);
+                // DIAG (off by default; toggle via admin "Enable diagnostic logging"): a decrypt
+                // mismatch (wrong conversation key / scheme) is surfaced on the server log, not
+                // just Debug, so it can be triaged.
+                if (diagnostics)
+                    _logger.LogInformation(ex, "NostrLogin DIAG session {SessionId}: could not decrypt event {EventId} from {Pubkey}", session.Id, evt.Id, evt.PublicKey);
                 continue;
             }
             if (msg is null)
@@ -387,8 +438,10 @@ public class NostrLoginService : IDisposable
                 {
                     signerPubkey = evt.PublicKey;
                     useNip04 = msgWasNip04;
-                    // DIAG (this instance only): milestone log — the handshake reached ack.
-                    _logger.LogInformation("NostrLogin DIAG session {SessionId}: ACK accepted from {Pubkey}, sending get_public_key (nip04={Nip04})", session.Id, signerPubkey, useNip04);
+                    // DIAG (off by default; toggle via admin "Enable diagnostic logging"):
+                    // milestone log — the handshake reached ack.
+                    if (diagnostics)
+                        _logger.LogInformation("NostrLogin DIAG session {SessionId}: ACK accepted from {Pubkey}, sending get_public_key (nip04={Nip04})", session.Id, signerPubkey, useNip04);
                     getPubkeyRequestId = await SendRequest(Publish, clientKey, clientPubkey, signerPubkey,
                         "get_public_key", [], useNip04);
                 }
@@ -397,7 +450,7 @@ public class NostrLoginService : IDisposable
 
             if (msg.Result == "auth_url")
             {
-                Fail(session, "This signer requires a browser-based authorization flow which is not supported. Please use a signer like Amber.");
+                Fail(session, "This signer requires a browser-based authorization flow which is not supported. Please use a signer like Amber.", diagnostics);
                 return;
             }
 
@@ -405,12 +458,12 @@ public class NostrLoginService : IDisposable
             {
                 if (!string.IsNullOrEmpty(msg.Error))
                 {
-                    Fail(session, "Signer returned an error: " + msg.Error);
+                    Fail(session, "Signer returned an error: " + msg.Error, diagnostics);
                     return;
                 }
                 if (msg.Result is not { Length: 64 } || !msg.Result.All(Uri.IsHexDigit))
                 {
-                    Fail(session, "Signer returned an invalid public key.");
+                    Fail(session, "Signer returned an invalid public key.", diagnostics);
                     return;
                 }
                 userPubkey = msg.Result.ToLowerInvariant();
@@ -432,7 +485,7 @@ public class NostrLoginService : IDisposable
             {
                 if (!string.IsNullOrEmpty(msg.Error))
                 {
-                    Fail(session, "Signer rejected the request: " + msg.Error);
+                    Fail(session, "Signer rejected the request: " + msg.Error, diagnostics);
                     return;
                 }
                 if (msg.Result is null)
@@ -445,14 +498,14 @@ public class NostrLoginService : IDisposable
                 }
                 catch (Exception)
                 {
-                    Fail(session, "Signer returned an invalid event.");
+                    Fail(session, "Signer returned an invalid event.", diagnostics);
                     return;
                 }
 
                 var error = ValidateSignedEvent(signed, userPubkey!, challenge!);
                 if (error is not null)
                 {
-                    Fail(session, error);
+                    Fail(session, error, diagnostics);
                     return;
                 }
 

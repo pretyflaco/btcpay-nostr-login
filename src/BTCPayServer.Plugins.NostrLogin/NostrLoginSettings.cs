@@ -15,6 +15,13 @@ public class NostrLoginSettings
     /// Relays encoded into the nostrconnect:// URI. Falls back to defaults when empty.
     /// </summary>
     public List<string>? Relays { get; set; }
+
+    /// <summary>
+    /// When true, verbose NIP-46 handshake milestones and failure reasons are written to the
+    /// server log (the "DIAG" lines). Off by default: kept in the code for debugging a stuck
+    /// signer, but silent in normal operation. Flip on temporarily to triage, then off again.
+    /// </summary>
+    public bool EnableDiagnosticLogging { get; set; }
 }
 
 /// <summary>

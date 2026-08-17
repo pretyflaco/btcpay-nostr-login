@@ -35,6 +35,15 @@
                     Leave empty to use the defaults: <code>@string.Join(", ", Model.DefaultRelays)</code>
                 </div>
             </div>
+            <div class="form-check my-3">
+                <input asp-for="EnableDiagnosticLogging" type="checkbox" class="form-check-input" />
+                <label asp-for="EnableDiagnosticLogging" class="form-check-label">Enable diagnostic logging</label>
+                <div class="form-text">
+                    Writes verbose NIP-46 handshake milestones and failure reasons to the server log.
+                    Off by default; enable only temporarily to debug a signer that never completes,
+                    then turn it back off.
+                </div>
+            </div>
             <button type="submit" class="btn btn-primary mt-3" id="SaveNostrLoginSettings">Save</button>
         </form>
     </div>
