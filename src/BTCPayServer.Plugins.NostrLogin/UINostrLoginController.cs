@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using NNostr.Client;
 using NNostr.Client.Protocols;
 using QRCoder;
 
@@ -94,6 +95,28 @@ public class UINostrLoginController : Controller
     /// <summary>App name shown by the signer, suffixed with the host so instances can be told apart.</summary>
     private string InstanceAppName() => $"BTCPay Server ({Request.Host})";
 
+    /// <summary>
+    /// The absolute URL the NIP-98 <c>u</c> tag is bound to (and the real open login endpoint). Built
+    /// from the request's public scheme/host so it matches what the browser reached — and, in turn,
+    /// what the signer origin-binds against.
+    /// </summary>
+    private string Nip98LoginUrl() => $"{PublicScheme()}://{PublicHost()}/login/nostr/nip98";
+
+    /// <summary>
+    /// Public scheme as seen by the client, honouring the reverse proxy BTCPay sits behind
+    /// (<c>X-Forwarded-Proto</c>) with a safe fallback to the request's own scheme.
+    /// </summary>
+    private string PublicScheme() =>
+        Request.Headers.TryGetValue("X-Forwarded-Proto", out var proto) && !string.IsNullOrEmpty(proto)
+            ? proto.ToString().Split(',')[0].Trim()
+            : Request.Scheme;
+
+    /// <summary>Public host as seen by the client (<c>X-Forwarded-Host</c> then <c>Host</c>).</summary>
+    private string PublicHost() =>
+        Request.Headers.TryGetValue("X-Forwarded-Host", out var host) && !string.IsNullOrEmpty(host)
+            ? host.ToString().Split(',')[0].Trim()
+            : Request.Host.ToString();
+
     private NostrLoginViewModel ToViewModel(Nip46Session session, string statusUrl, string? returnUrl = null)
     {
         var failedUpFront = session.Status == Nip46SessionStatus.Failed;
@@ -140,7 +163,7 @@ public class UINostrLoginController : Controller
             bindingNonce: bindingNonce,
             rateLimitKey: HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
-            diagnostics: await GetDiagnosticsEnabled());
+            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl());
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
     }
@@ -155,7 +178,11 @@ public class UINostrLoginController : Controller
         switch (session.Status)
         {
             case Nip46SessionStatus.Pending:
-                return Json(new { status = "pending" });
+                // Web-signer flow: the signer asked the user to open an auth_url to approve. Surface
+                // it so the login page can show the link; the handshake continues in the background.
+                return session.AuthUrl is not null
+                    ? Json(new { status = "auth_required", authUrl = session.AuthUrl })
+                    : Json(new { status = "pending" });
             case Nip46SessionStatus.Failed:
                 _nostrLoginService.RemoveSession(session.Id);
                 return Json(new { status = "failed", error = session.Error });
@@ -174,38 +201,115 @@ public class UINostrLoginController : Controller
             });
         }
 
-        var pubkey = session.UserPubkey!;
-        var user = await FindUserByPubkey(pubkey);
+        var (user, resolveError) = await ResolveOrCreateUser(session.UserPubkey!);
         if (user is null)
-        {
-            var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
-            if (!settings.AllowAutoUserCreation)
-                return Json(new
-                {
-                    status = "failed",
-                    error = "No account is linked to this Nostr key. Sign in another way and link it under Account -> Nostr."
-                });
-            var (createdUser, createError) = await AutoCreateUser(pubkey);
-            if (createdUser is null)
-                return Json(new { status = "failed", error = createError ?? "Could not create a new account for this Nostr key." });
-            user = createdUser;
-        }
+            return Json(new { status = "failed", error = resolveError });
 
-        var canLoginContext = new UserService.CanLoginContext(user);
-        if (!await _userService.CanLogin(canLoginContext))
-            return Json(new
-            {
-                status = "failed",
-                error = canLoginContext.Failures.Count > 0
-                    ? string.Join(" ", canLoginContext.Failures.Select(f => f.ToString()))
-                    : "This account is not allowed to log in."
-            });
+        if (!CanLoginOk(user, out var loginError))
+            return Json(new { status = "failed", error = loginError });
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         _nostrLoginService.RemoveSession(session.Id); // single use, removed only after success
         Response.Cookies.Delete(BindCookieName);
         var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
         return Json(new { status = "approved", redirect });
+    }
+
+    /// <summary>
+    /// Resolves a proven nostr pubkey to a BTCPay user, auto-creating one when the admin enabled it
+    /// (honouring the server's own registration policies). Shared by the QR status poller and the
+    /// open NIP-98 endpoint. Returns (null, error) when no login is possible.
+    /// </summary>
+    private async Task<(ApplicationUser? User, string? Error)> ResolveOrCreateUser(string pubkey)
+    {
+        var user = await FindUserByPubkey(pubkey);
+        if (user is not null)
+            return (user, null);
+
+        var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
+        if (!settings.AllowAutoUserCreation)
+            return (null, "No account is linked to this Nostr key. Sign in another way and link it under Account -> Nostr.");
+
+        var (createdUser, createError) = await AutoCreateUser(pubkey);
+        return createdUser is null
+            ? (null, createError ?? "Could not create a new account for this Nostr key.")
+            : (createdUser, null);
+    }
+
+    /// <summary>Runs BTCPay's CanLogin gate; returns false + a human error when the user may not sign in.</summary>
+    private bool CanLoginOk(ApplicationUser user, out string? error)
+    {
+        var ctx = new UserService.CanLoginContext(user);
+        if (_userService.CanLogin(ctx).GetAwaiter().GetResult())
+        {
+            error = null;
+            return true;
+        }
+        error = ctx.Failures.Count > 0
+            ? string.Join(" ", ctx.Failures.Select(f => f.ToString()))
+            : "This account is not allowed to log in.";
+        return false;
+    }
+
+    /// <summary>
+    /// Open NIP-98 (HTTP Auth, kind 27235) login endpoint. Accepts <c>Authorization: Nostr &lt;base64&gt;</c>
+    /// and signs in the proven key if it maps to an allowlisted user (or auto-creation is enabled).
+    ///
+    /// SECURITY: this is a standalone entry point WITHOUT the QR browser-binding (anti-QRLjacking)
+    /// step — by design, so external NIP-98 clients (e.g. the vezir CLI) can log in. The gate is the
+    /// full NIP-98 proof: a valid Schnorr signature by an allowlisted key, bound to THIS URL + POST,
+    /// fresh, and single-use (replay-guarded), plus per-IP rate limiting. A stolen event is
+    /// URL-bound and replay-blocked; it cannot be replayed here.
+    /// </summary>
+    [AllowAnonymous]
+    [IgnoreAntiforgeryToken]
+    [HttpPost("/login/nostr/nip98")]
+    public async Task<IActionResult> Nip98Login(string? returnUrl = null)
+    {
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        if (!_nostrLoginService.AllowLogin(ip))
+            return StatusCode(StatusCodes.Status429TooManyRequests,
+                new { status = "failed", error = "Too many sign-in attempts. Please wait a moment and try again." });
+
+        var signed = TryDecodeNostrAuthHeader(Request.Headers.Authorization.ToString());
+        if (signed is null)
+            return Unauthorized(new { status = "failed", error = "Missing or malformed Authorization: Nostr header." });
+
+        // expectedNonce = null: no prior session, so the signature + URL binding + replay guard are
+        // the gate. The `u` tag must equal this endpoint's public URL.
+        var error = Nip98.Validate(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "POST", null);
+        if (error is not null)
+            return Unauthorized(new { status = "failed", error });
+
+        var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
+        if (user is null)
+            return Json(new { status = "failed", error = resolveError });
+
+        if (!CanLoginOk(user, out var loginError))
+            return Json(new { status = "failed", error = loginError });
+
+        await _signInManager.SignInAsync(user, false, "NostrLogin");
+        var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
+        return Json(new { status = "approved", redirect });
+    }
+
+    /// <summary>Decode an <c>Authorization: Nostr &lt;base64-json-event&gt;</c> header to an event, or null.</summary>
+    private static NostrEvent? TryDecodeNostrAuthHeader(string? header)
+    {
+        if (string.IsNullOrWhiteSpace(header))
+            return null;
+        var parts = header.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length != 2 || !string.Equals(parts[0], "Nostr", StringComparison.OrdinalIgnoreCase))
+            return null;
+        try
+        {
+            var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
+            return System.Text.Json.JsonSerializer.Deserialize<NostrEvent>(json);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     [Authorize(AuthenticationSchemes = AuthenticationSchemes.Cookie)]
@@ -246,7 +350,7 @@ public class UINostrLoginController : Controller
         var session = await _nostrLoginService.CreateSessionAsync(
             Nip46SessionPurpose.Link, await GetRelays(), InstanceAppName(), user.Id,
             appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
-            diagnostics: await GetDiagnosticsEnabled());
+            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl());
         return RedirectToAction(nameof(Account), new { linkSession = session.Id });
     }
 
@@ -261,7 +365,9 @@ public class UINostrLoginController : Controller
         switch (session.Status)
         {
             case Nip46SessionStatus.Pending:
-                return Json(new { status = "pending" });
+                return session.AuthUrl is not null
+                    ? Json(new { status = "auth_required", authUrl = session.AuthUrl })
+                    : Json(new { status = "pending" });
             case Nip46SessionStatus.Failed:
                 _nostrLoginService.RemoveSession(session.Id);
                 return Json(new { status = "failed", error = session.Error });

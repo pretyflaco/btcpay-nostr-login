@@ -27,6 +27,10 @@
             <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
             <span class="ms-2 text-secondary">Waiting for signer approval&hellip;</span>
         </div>
+        <div class="alert alert-info mt-4" id="NostrAuthUrl" style="display:none;">
+            Your signer needs an extra approval step.
+            <a href="#" id="NostrAuthUrlLink" target="_blank" rel="noopener">Open your signer to approve</a>.
+        </div>
         <div class="alert alert-danger mt-4" id="NostrError" style="display:none;"></div>
         <div class="mt-4">
             <a href="/login" id="BackToLogin">Sign in another way</a>
@@ -50,6 +54,11 @@
                     if (data.status === "approved") {
                         clearInterval(timer);
                         window.location.href = data.redirect;
+                    } else if (data.status === "auth_required") {
+                        var box = document.getElementById("NostrAuthUrl");
+                        var link = document.getElementById("NostrAuthUrlLink");
+                        link.href = data.authUrl;
+                        box.style.display = "block";
                     } else if (data.status === "failed") {
                         clearInterval(timer);
                         document.getElementById("NostrPending").style.display = "none";

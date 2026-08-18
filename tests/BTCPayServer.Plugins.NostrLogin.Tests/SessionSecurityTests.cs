@@ -53,9 +53,10 @@ public class ConnectUriTests
         Assert.Contains("relay=" + Uri.EscapeDataString("wss://nos.lol"), uri);
         Assert.Contains("relay=" + Uri.EscapeDataString("wss://relay.primal.net"), uri);
         Assert.Contains("secret=deadbeef", uri);
-        // Only the sign_event:22242 permission is requested — never a broader scope.
+        // NIP-98 (kind 27235) sign + pubkey read is requested by default so standards-aware
+        // signers can pre-grant it; the 22242 challenge remains as a runtime fallback.
         var query = HttpUtility.ParseQueryString(new Uri(uri).Query);
-        Assert.Equal("sign_event:22242", query["perms"]);
+        Assert.Equal("sign_event:27235,get_public_key", query["perms"]);
         Assert.Equal("BTCPay Server", query["name"]);
     }
 

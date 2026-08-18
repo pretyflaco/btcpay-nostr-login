@@ -1,13 +1,11 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using NBitcoin.Secp256k1;
@@ -47,6 +45,18 @@ public class Nip46Session
 
     public string? Error { get; internal set; }
 
+    /// <summary>Per-session NIP-98 nonce embedded as the signed event's <c>challenge</c> tag (QR flow).</summary>
+    internal string? Nip98Nonce { get; set; }
+
+    /// <summary>Per-session kind-22242 challenge (fallback path).</summary>
+    internal string? Challenge22242 { get; set; }
+
+    /// <summary>
+    /// HTTPS auth_url the bound signer asked the user to open to approve (web-signer flow). Surfaced
+    /// to the browser by the status poller; cleared once the signer returns the real signed event.
+    /// </summary>
+    public string? AuthUrl { get; internal set; }
+
     /// <summary>
     /// Random nonce bound to the browser that created a Login session (M2, anti-QRLjacking).
     /// The sign-in cookie is only issued when the caller presents a matching bind cookie.
@@ -82,9 +92,6 @@ public class NostrLoginService : IDisposable
     public const string DefaultImageUrl = "https://avatars.githubusercontent.com/u/31132886?s=200&v=4";
 
     private static readonly TimeSpan SessionLifetime = TimeSpan.FromMinutes(5);
-    // Per-relay connect timeout. Kept short: connecting now happens off the request thread (the QR
-    // renders immediately), but a shorter cap still bounds how long a dead relay lingers.
-    private static readonly TimeSpan RelayConnectTimeout = TimeSpan.FromSeconds(5);
     private const int SignedEventMaxAgeMinutes = 10;
 
     // M3: throttle anonymous login-session creation to bound relay connections / background tasks.
@@ -124,7 +131,7 @@ public class NostrLoginService : IDisposable
     /// </summary>
     public Task<Nip46Session> CreateSessionAsync(Nip46SessionPurpose purpose, string[] relays, string appName,
         string? linkUserId = null, string? bindingNonce = null, string? rateLimitKey = null,
-        string? appUrl = null, string? imageUrl = null, bool diagnostics = false)
+        string? appUrl = null, string? imageUrl = null, bool diagnostics = false, string? loginUrl = null)
     {
         Cleanup();
 
@@ -166,7 +173,7 @@ public class NostrLoginService : IDisposable
 
         // Everything relay-related runs off the request thread. The QR is returned synchronously
         // below; by the time a human scans it (seconds later) the background connect has completed.
-        _ = Task.Run(() => RunSessionAsync(session, clientKey, clientPubkey, secret, relays, diagnostics));
+        _ = Task.Run(() => RunSessionAsync(session, clientKey, clientPubkey, secret, relays, diagnostics, loginUrl));
 
         return Task.FromResult(session);
     }
@@ -176,75 +183,34 @@ public class NostrLoginService : IDisposable
     /// Isolated from <see cref="CreateSessionAsync"/> so the request thread never waits on relays.
     /// </summary>
     private async Task RunSessionAsync(Nip46Session session, ECPrivKey clientKey, string clientPubkey,
-        string secret, string[] relays, bool diagnostics)
+        string secret, string[] relays, bool diagnostics, string? loginUrl)
     {
         var ct = session.Cts.Token;
-        var clients = new List<NostrClient>();
+        // The pool owns all per-relay connections + the kind-24133 subscription and provides the
+        // reliability primitives (fan-out publish, reconnect-dead). Subscribe-before-read is
+        // preserved: ConnectAsync subscribes each relay before ProcessAsync reads any event, so the
+        // one-shot connect ack is never missed.
+        var pool = new RelayPool(relays, clientPubkey, _logger, session.Id, diagnostics);
         try
         {
             // Connect to all relays in parallel and tolerate partial failures: one dead relay must
-            // neither kill the session nor delay the others (previously connects were sequential,
-            // so a single slow relay added its full timeout to the total).
-            var connectTasks = relays.Select(async relay =>
-            {
-                var relayClient = new NostrClient(new Uri(relay));
-                try
-                {
-                    using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    connectCts.CancelAfter(RelayConnectTimeout);
-                    await relayClient.ConnectAndWaitUntilConnected(connectCts.Token, ct);
-                    return relayClient;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning("NostrLogin session {SessionId}: could not connect to relay {Relay}: {Error}",
-                        session.Id, relay, ex.Message);
-                    relayClient.Dispose();
-                    return null;
-                }
-            }).ToList();
-
-            foreach (var connected in await Task.WhenAll(connectTasks))
-                if (connected is not null)
-                    clients.Add(connected);
-
-            if (clients.Count == 0)
+            // neither kill the session nor delay the others.
+            var connected = await pool.ConnectAsync(ct);
+            if (connected == 0)
             {
                 Fail(session, "Could not connect to any nostr relay.", diagnostics);
                 return;
             }
 
-            // Subscribe before we start reading: the connect ack is sent exactly once.
-            var events = Channel.CreateUnbounded<NostrEvent>();
-            var subscriptionId = Guid.NewGuid().ToString("N");
-            var filters = new[]
-            {
-                new NostrSubscriptionFilter
-                {
-                    Kinds = [24133],
-                    ReferencedPublicKeys = [clientPubkey]
-                }
-            };
             // DIAG (off by default; toggle via admin "Enable diagnostic logging"): surface the
             // handshake start so a signer that never completes can be triaged (the failure path is
             // otherwise Debug-only / browser-only).
             if (diagnostics)
                 _logger.LogInformation(
                     "NostrLogin DIAG session {SessionId}: listening on {RelayCount} relay(s) [{Relays}] for #p={ClientPubkey}",
-                    session.Id, clients.Count, string.Join(", ", relays), clientPubkey);
-            foreach (var relayClient in clients)
-            {
-                relayClient.EventsReceived += (_, args) =>
-                {
-                    if (args.subscriptionId != subscriptionId)
-                        return;
-                    foreach (var evt in args.events)
-                        events.Writer.TryWrite(evt);
-                };
-                await relayClient.CreateSubscription(subscriptionId, filters, ct);
-            }
+                    session.Id, connected, string.Join(", ", relays), clientPubkey);
 
-            await ProcessAsync(session, clientKey, clientPubkey, secret, clients, events, ct, diagnostics);
+            await ProcessAsync(session, clientKey, clientPubkey, secret, pool, ct, diagnostics, loginUrl);
         }
         catch (OperationCanceledException)
         {
@@ -257,16 +223,7 @@ public class NostrLoginService : IDisposable
         }
         finally
         {
-            foreach (var relayClient in clients)
-            {
-                try
-                {
-                    relayClient.Dispose();
-                }
-                catch (Exception)
-                {
-                }
-            }
+            pool.Dispose();
             // M1: ProcessAsync returns immediately on any terminal state (approved / failed /
             // timeout / exception), so the ephemeral key is wiped and disposed promptly on
             // resolution rather than lingering until the stale-session sweep.
@@ -330,6 +287,12 @@ public class NostrLoginService : IDisposable
                 _rateLimit.TryRemove(key, out _);
     }
 
+    /// <summary>
+    /// Public rate-limit gate for the anonymous NIP-98 endpoint: returns true if a login attempt is
+    /// allowed for this key (typically the client IP) and records it.
+    /// </summary>
+    public bool AllowLogin(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
+
     // Exposed for unit tests.
     internal bool AllowLoginAttemptForTest(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
     internal static int MaxLoginSessionsPerWindowForTest => MaxLoginSessionsPerWindow;
@@ -341,11 +304,11 @@ public class NostrLoginService : IDisposable
     /// show a recognisable avatar and tell instances apart.
     /// </summary>
     internal static string BuildConnectUri(string clientPubkey, string[] relays, string secret, string appName,
-        string? appUrl = null, string? imageUrl = null)
+        string? appUrl = null, string? imageUrl = null, string perms = "sign_event:27235,get_public_key")
     {
         var relayParams = string.Join("&", relays.Select(r => "relay=" + Uri.EscapeDataString(r)));
         var uri = $"nostrconnect://{clientPubkey}?{relayParams}&secret={secret}" +
-                  $"&perms={Uri.EscapeDataString("sign_event:22242")}" +
+                  $"&perms={Uri.EscapeDataString(perms)}" +
                   $"&name={Uri.EscapeDataString(appName)}";
         if (!string.IsNullOrEmpty(appUrl))
             uri += $"&url={Uri.EscapeDataString(appUrl)}";
@@ -379,35 +342,130 @@ public class NostrLoginService : IDisposable
         [JsonPropertyName("error")] public string? Error { get; set; }
     }
 
-    private async Task ProcessAsync(Nip46Session session, ECPrivKey clientKey, string clientPubkey,
-        string secret, List<NostrClient> clients, Channel<NostrEvent> events, CancellationToken ct,
-        bool diagnostics)
+    private enum AuthScheme
     {
-        async Task Publish(NostrEvent evt)
+        Nip98,
+        Challenge22242
+    }
+
+    // How long we wait for the signer to sign the NIP-98 (27235) event before falling back to the
+    // legacy kind-22242 challenge. A signer that does not pre-grant 27235 raises a per-request
+    // approval the user may never see (they only expect one tap), so we time out and try 22242.
+    private static readonly TimeSpan Nip98SignSubTimeout = TimeSpan.FromSeconds(20);
+
+    // Re-broadcast an in-flight request this often while awaiting its response. Ephemeral
+    // kind-24133 events can be dropped; periodic republish (+ reconnecting dead relays first)
+    // self-heals a lost publish and picks up a relay that came back mid-wait.
+    private static readonly TimeSpan RepublishInterval = TimeSpan.FromSeconds(4);
+
+    private async Task ProcessAsync(Nip46Session session, ECPrivKey clientKey, string clientPubkey,
+        string secret, RelayPool pool, CancellationToken ct, bool diagnostics, string? loginUrl)
+    {
+        // Broadcast (with a dead-relay reconnect first) so our and the signer's relay sets keep
+        // overlapping — the common cause of a request never reaching the signer is too few shared,
+        // live relays carrying it.
+        async Task<int> Publish(NostrEvent evt)
         {
-            foreach (var relayClient in clients)
-            {
-                try
-                {
-                    await relayClient.PublishEvent(evt, ct);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogDebug("NostrLogin session {SessionId}: publish failed on a relay: {Error}", session.Id, ex.Message);
-                }
-            }
+            await pool.ReconnectDeadAsync(ct);
+            return await pool.PublishAsync(evt, ct);
         }
 
         string? signerPubkey = null;
         string? userPubkey = null;
         var useNip04 = false;
-        string? getPubkeyRequestId = null;
-        string? signRequestId = null;
-        string? challenge = null;
         var seenEventIds = new HashSet<string>();
 
-        await foreach (var evt in events.Reader.ReadAllAsync(ct))
+        // The single in-flight request we are awaiting (build once, republish many). Null between
+        // requests. Rebuilt for each new request so republish re-sends the exact same event.
+        NostrEvent? inflight = null;
+        string? inflightId = null;
+        var lastPublish = DateTimeOffset.UtcNow;
+
+        // NIP-98 sign attempt bookkeeping (for the 22242 fallback).
+        var scheme = AuthScheme.Nip98;
+        DateTimeOffset? nip98SignSentAt = null;
+
+        async Task<(NostrEvent evt, string id)> Send(string method, string[] parameters)
         {
+            var (evt, id) = await BuildRequestEvent(clientKey, clientPubkey, signerPubkey!, method, parameters, useNip04);
+            inflight = evt;
+            inflightId = id;
+            lastPublish = DateTimeOffset.UtcNow;
+            if (await Publish(evt) == 0)
+                _logger.LogDebug("NostrLogin session {SessionId}: {Method} reached no relay (will republish)", session.Id, method);
+            return (evt, id);
+        }
+
+        // Build the sign_event request for the current scheme against the resolved user pubkey.
+        async Task SendSignRequest()
+        {
+            JsonObject unsigned;
+            if (scheme == AuthScheme.Nip98)
+            {
+                // NIP-98 (kind 27235): bind to the login URL + method; embed the per-session nonce
+                // as a `challenge` tag so the plugin's browser-session binding and NIP-98
+                // request-binding coexist. loginUrl is always set for a real login/link flow.
+                session.Nip98Nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+                unsigned = new JsonObject
+                {
+                    ["kind"] = 27235,
+                    ["created_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    ["content"] = "",
+                    ["tags"] = new JsonArray(
+                        new JsonArray("u", loginUrl ?? ""),
+                        new JsonArray("method", "POST"),
+                        new JsonArray("challenge", session.Nip98Nonce))
+                };
+                nip98SignSentAt = DateTimeOffset.UtcNow;
+            }
+            else
+            {
+                session.Challenge22242 = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+                unsigned = new JsonObject
+                {
+                    ["kind"] = 22242,
+                    ["created_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    ["content"] = $"BTCPay Server sign-in challenge: {session.Challenge22242}",
+                    ["tags"] = new JsonArray(new JsonArray("challenge", session.Challenge22242))
+                };
+            }
+            await Send("sign_event", [unsigned.ToJsonString()]);
+        }
+
+        while (!ct.IsCancellationRequested)
+        {
+            // Republish the in-flight request on a timer so a dropped/mis-routed publish self-heals.
+            if (inflight is not null && DateTimeOffset.UtcNow - lastPublish >= RepublishInterval)
+            {
+                lastPublish = DateTimeOffset.UtcNow;
+                await Publish(inflight);
+            }
+
+            // Fall back to the legacy 22242 challenge if the signer never signs the NIP-98 event
+            // (it likely raised a per-request approval the user does not expect). Only while the
+            // sign request is the in-flight one and we are still on the NIP-98 attempt.
+            if (scheme == AuthScheme.Nip98 && userPubkey is not null && nip98SignSentAt is not null
+                && DateTimeOffset.UtcNow - nip98SignSentAt >= Nip98SignSubTimeout)
+            {
+                if (diagnostics)
+                    _logger.LogInformation("NostrLogin DIAG session {SessionId}: NIP-98 sign timed out; falling back to kind-22242", session.Id);
+                scheme = AuthScheme.Challenge22242;
+                nip98SignSentAt = null;
+                await SendSignRequest();
+            }
+
+            NostrEvent? evt;
+            try
+            {
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(TimeSpan.FromSeconds(1)); // wake to run the republish/fallback timers
+                evt = await pool.Events.ReadAsync(readCts.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                continue; // timer tick, no event this second
+            }
+
             if (evt.Id is null || !seenEventIds.Add(evt.Id))
                 continue; // deduplicate across relays
             if (signerPubkey is not null && evt.PublicKey != signerPubkey)
@@ -442,20 +500,36 @@ public class NostrLoginService : IDisposable
                     // milestone log — the handshake reached ack.
                     if (diagnostics)
                         _logger.LogInformation("NostrLogin DIAG session {SessionId}: ACK accepted from {Pubkey}, sending get_public_key (nip04={Nip04})", session.Id, signerPubkey, useNip04);
-                    getPubkeyRequestId = await SendRequest(Publish, clientKey, clientPubkey, signerPubkey,
-                        "get_public_key", [], useNip04);
+                    await Send("get_public_key", []);
                 }
                 continue;
             }
 
+            // auth_url challenge: surface it (guarded) so a web signer can complete, then keep
+            // waiting for the real result on the same request. Only honour an HTTPS auth_url from
+            // the bound signer (anti-phishing); anything else is logged and dropped.
             if (msg.Result == "auth_url")
             {
-                Fail(session, "This signer requires a browser-based authorization flow which is not supported. Please use a signer like Amber.", diagnostics);
-                return;
+                var url = msg.Error;
+                if (url is not null && url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                    && evt.PublicKey == signerPubkey)
+                {
+                    if (session.AuthUrl != url)
+                    {
+                        session.AuthUrl = url;
+                        _logger.LogInformation("NostrLogin session {SessionId}: signer requested auth_url approval", session.Id);
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning("NostrLogin session {SessionId}: ignoring untrusted auth_url", session.Id);
+                }
+                continue;
             }
 
-            if (msg.Id == getPubkeyRequestId && userPubkey is null)
+            if (msg.Id == inflightId && userPubkey is null)
             {
+                // This is the get_public_key response.
                 if (!string.IsNullOrEmpty(msg.Error))
                 {
                     Fail(session, "Signer returned an error: " + msg.Error, diagnostics);
@@ -467,24 +541,26 @@ public class NostrLoginService : IDisposable
                     return;
                 }
                 userPubkey = msg.Result.ToLowerInvariant();
-
-                challenge = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
-                var unsigned = new JsonObject
-                {
-                    ["kind"] = 22242,
-                    ["created_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    ["content"] = $"BTCPay Server sign-in challenge: {challenge}",
-                    ["tags"] = new JsonArray(new JsonArray("challenge", challenge))
-                };
-                signRequestId = await SendRequest(Publish, clientKey, clientPubkey, signerPubkey,
-                    "sign_event", [unsigned.ToJsonString()], useNip04);
+                await SendSignRequest();
                 continue;
             }
 
-            if (msg.Id == signRequestId)
+            if (msg.Id == inflightId && userPubkey is not null)
             {
+                // This is a sign_event response for the current scheme.
                 if (!string.IsNullOrEmpty(msg.Error))
                 {
+                    // On the NIP-98 attempt, a signer error means it will not pre-grant 27235;
+                    // fall back to 22242 rather than failing the whole login.
+                    if (scheme == AuthScheme.Nip98)
+                    {
+                        if (diagnostics)
+                            _logger.LogInformation("NostrLogin DIAG session {SessionId}: NIP-98 sign rejected ({Error}); falling back to kind-22242", session.Id, msg.Error);
+                        scheme = AuthScheme.Challenge22242;
+                        nip98SignSentAt = null;
+                        await SendSignRequest();
+                        continue;
+                    }
                     Fail(session, "Signer rejected the request: " + msg.Error, diagnostics);
                     return;
                 }
@@ -502,7 +578,9 @@ public class NostrLoginService : IDisposable
                     return;
                 }
 
-                var error = ValidateSignedEvent(signed, userPubkey!, challenge!);
+                var error = scheme == AuthScheme.Nip98
+                    ? Nip98.Validate(signed, userPubkey!, loginUrl ?? "", "POST", session.Nip98Nonce)
+                    : ValidateSignedEvent(signed, userPubkey!, session.Challenge22242!);
                 if (error is not null)
                 {
                     Fail(session, error, diagnostics);
@@ -511,10 +589,14 @@ public class NostrLoginService : IDisposable
 
                 session.UserPubkey = userPubkey;
                 session.Status = Nip46SessionStatus.Approved;
-                _logger.LogInformation("NostrLogin session {SessionId} approved for pubkey {Pubkey}", session.Id, userPubkey);
+                session.AuthUrl = null;
+                _logger.LogInformation("NostrLogin session {SessionId} approved for pubkey {Pubkey} (scheme={Scheme})",
+                    session.Id, userPubkey, scheme);
                 return;
             }
         }
+
+        ct.ThrowIfCancellationRequested();
     }
 
     /// <summary>
@@ -559,7 +641,12 @@ public class NostrLoginService : IDisposable
         return (JsonSerializer.Deserialize<Nip46Rpc>(json), wasNip04);
     }
 
-    private static async Task<string> SendRequest(Func<NostrEvent, Task> publish, ECPrivKey clientKey, string clientPubkey,
+    /// <summary>
+    /// Encrypt + sign a kind-24133 request event. Building is kept separate from publishing so the
+    /// wait loop can re-broadcast the exact same event on a flaky link (a single ws.send the local
+    /// OS accepts does not guarantee the relay delivered it).
+    /// </summary>
+    private static async Task<(NostrEvent evt, string requestId)> BuildRequestEvent(ECPrivKey clientKey, string clientPubkey,
         string signerPubkey, string method, string[] parameters, bool useNip04)
     {
         var requestId = Guid.NewGuid().ToString("N");
@@ -580,8 +667,7 @@ public class NostrLoginService : IDisposable
             evt.Content = NIP44.Encrypt(clientKey, NostrExtensions.ParsePubKey(signerPubkey), json);
 
         await evt.ComputeIdAndSignAsync(clientKey, handlenip4: false);
-        await publish(evt);
-        return requestId;
+        return (evt, requestId);
     }
 
     public void Dispose()

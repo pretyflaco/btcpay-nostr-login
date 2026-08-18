@@ -68,8 +68,10 @@ public class Nip46FlowTests
         }
 
         var relays = new[] { relay };
+        const string loginUrl = "https://btcpay.test/login/nostr/nip98";
         var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
-        var session = await service.CreateSessionAsync(Nip46SessionPurpose.Login, relays, "NostrLoginTest");
+        var session = await service.CreateSessionAsync(Nip46SessionPurpose.Login, relays, "NostrLoginTest",
+            loginUrl: loginUrl);
 
         // Parse the nostrconnect:// URI like a signer app would
         var uri = new Uri(session.ConnectUri);
@@ -78,7 +80,8 @@ public class Nip46FlowTests
         var query = HttpUtility.ParseQueryString(uri.Query);
         var secret = query["secret"]!;
         Assert.NotNull(secret);
-        Assert.Contains("sign_event:22242", query["perms"]);
+        // Default flow now requests NIP-98 (kind 27235) signing.
+        Assert.Contains("sign_event:27235", query["perms"]);
         var clientPubkey = NostrExtensions.ParsePubKey(clientPubkeyHex);
 
         var filters = new[]
