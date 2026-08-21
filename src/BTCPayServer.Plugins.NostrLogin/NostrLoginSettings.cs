@@ -22,6 +22,13 @@ public class NostrLoginSettings
     /// signer, but silent in normal operation. Flip on temporarily to triage, then off again.
     /// </summary>
     public bool EnableDiagnosticLogging { get; set; }
+
+    /// <summary>
+    /// When true (default), a Nostr sign-in syncs the identity's kind-0 profile picture into
+    /// the user's BTCPay avatar (shown in the top-right account menu). Read-only relay fetch +
+    /// BTCPay file storage; runs off the request path.
+    /// </summary>
+    public bool SyncProfilePictures { get; set; } = true;
 }
 
 /// <summary>

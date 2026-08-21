@@ -36,6 +36,15 @@
                 </div>
             </div>
             <div class="form-check my-3">
+                <input asp-for="SyncProfilePictures" type="checkbox" class="form-check-input" />
+                <label asp-for="SyncProfilePictures" class="form-check-label">Sync Nostr profile pictures on sign-in</label>
+                <div class="form-text">
+                    When enabled (default), a Nostr sign-in fetches the identity's kind-0 profile photo from relays
+                    and sets it as the user's BTCPay avatar (top-right account menu). Read-only fetch, off the
+                    request path; the avatar follows profile updates on each sign-in.
+                </div>
+            </div>
+            <div class="form-check my-3">
                 <input asp-for="EnableDiagnosticLogging" type="checkbox" class="form-check-input" />
                 <label asp-for="EnableDiagnosticLogging" class="form-check-label">Enable diagnostic logging</label>
                 <div class="form-text">

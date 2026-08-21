@@ -3,6 +3,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
 using BTCPayServer.Abstractions.Constants;
+using BTCPayServer.Abstractions.Extensions;
 using BTCPayServer.Abstractions.Contracts;
 using BTCPayServer.Data;
 using BTCPayServer.Services;
@@ -44,6 +45,9 @@ public class NostrLoginServerSettingsViewModel
     /// <summary>Verbose NIP-46 handshake logging; off by default, for debugging a stuck signer.</summary>
     public bool EnableDiagnosticLogging { get; set; }
 
+    /// <summary>Sync the Nostr kind-0 profile picture into the user's BTCPay avatar on login.</summary>
+    public bool SyncProfilePictures { get; set; }
+
     public int LinkedKeyCount { get; set; }
     public string[] DefaultRelays { get; set; } = [];
 }
@@ -51,6 +55,7 @@ public class NostrLoginServerSettingsViewModel
 public class UINostrLoginController : Controller
 {
     private readonly NostrLoginService _nostrLoginService;
+    private readonly NostrProfilePictureService _profilePictureService;
     private readonly SignInManager<ApplicationUser> _signInManager;
     private readonly UserManager<ApplicationUser> _userManager;
     private readonly UserService _userService;
@@ -59,6 +64,7 @@ public class UINostrLoginController : Controller
 
     public UINostrLoginController(
         NostrLoginService nostrLoginService,
+        NostrProfilePictureService profilePictureService,
         SignInManager<ApplicationUser> signInManager,
         UserManager<ApplicationUser> userManager,
         UserService userService,
@@ -66,6 +72,7 @@ public class UINostrLoginController : Controller
         PoliciesSettings policiesSettings)
     {
         _nostrLoginService = nostrLoginService;
+        _profilePictureService = profilePictureService;
         _signInManager = signInManager;
         _userManager = userManager;
         _userService = userService;
@@ -208,6 +215,8 @@ public class UINostrLoginController : Controller
         if (!CanLoginOk(user, out var loginError))
             return Json(new { status = "failed", error = loginError });
 
+        _profilePictureService.SyncInBackground(user.Id, session.UserPubkey!);
+
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         _nostrLoginService.RemoveSession(session.Id); // single use, removed only after success
         Response.Cookies.Delete(BindCookieName);
@@ -288,9 +297,57 @@ public class UINostrLoginController : Controller
         if (!CanLoginOk(user, out var loginError))
             return Json(new { status = "failed", error = loginError });
 
+        _profilePictureService.SyncInBackground(user.Id, signed.PublicKey!);
+
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
         return Json(new { status = "approved", redirect });
+    }
+
+    /// <summary>
+    /// Same-device "magic link" NIP-98 login: the GET variant of the open endpoint above, for a
+    /// signer app running on the SAME device as the browser (the one-click BTCPay setup flow).
+    /// The app signs a kind-27235 event locally (<c>u</c> = this URL, <c>method</c> = GET) and
+    /// opens the browser to <c>/login/nostr/nip98?event=&lt;base64url&gt;</c>; validation, user
+    /// resolution and sign-in are identical to the POST form — the only difference is the
+    /// transport (query param instead of an Authorization header a browser cannot send).
+    ///
+    /// SECURITY: same posture as the POST endpoint (no QR browser-binding — by design; the gate
+    /// is the full NIP-98 proof + per-IP rate limiting). The event travels in a URL (server logs,
+    /// browser history), which is acceptable because it is single-use (replay guard), freshness
+    /// windowed (10 min), and URL/method-bound. The redirect drops the query immediately.
+    /// </summary>
+    [AllowAnonymous]
+    [HttpGet("/login/nostr/nip98")]
+    public async Task<IActionResult> Nip98LoginLink([FromQuery(Name = "event")] string? eventParam,
+        string? returnUrl = null)
+    {
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        if (!_nostrLoginService.AllowLogin(ip))
+            return StatusCode(StatusCodes.Status429TooManyRequests,
+                new { status = "failed", error = "Too many sign-in attempts. Please wait a moment and try again." });
+
+        var signed = TryDecodeNostrEvent(eventParam);
+        if (signed is null)
+            return Unauthorized(new { status = "failed", error = "Missing or malformed event parameter." });
+
+        // expectedNonce = null: no prior session (same open posture as the POST endpoint). The
+        // `u` tag must equal this endpoint's public URL and the method tag must be GET.
+        var error = Nip98.Validate(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "GET", null);
+        if (error is not null)
+            return Unauthorized(new { status = "failed", error });
+
+        var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
+        if (user is null)
+            return Json(new { status = "failed", error = resolveError });
+
+        if (!CanLoginOk(user, out var loginError))
+            return Json(new { status = "failed", error = loginError });
+
+        _profilePictureService.SyncInBackground(user.Id, signed.PublicKey!);
+
+        await _signInManager.SignInAsync(user, false, "NostrLogin");
+        return LocalRedirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
     }
 
     /// <summary>Decode an <c>Authorization: Nostr &lt;base64-json-event&gt;</c> header to an event, or null.</summary>
@@ -301,9 +358,23 @@ public class UINostrLoginController : Controller
         var parts = header.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (parts.Length != 2 || !string.Equals(parts[0], "Nostr", StringComparison.OrdinalIgnoreCase))
             return null;
+        return TryDecodeNostrEvent(parts[1]);
+    }
+
+    /// <summary>
+    /// Decode a base64url (or standard base64) encoded JSON event to an event, or null.
+    /// Tolerates both alphabets and missing padding so callers can pass it through a URL query
+    /// without re-encoding concerns.
+    /// </summary>
+    internal static NostrEvent? TryDecodeNostrEvent(string? encoded)
+    {
+        if (string.IsNullOrWhiteSpace(encoded))
+            return null;
         try
         {
-            var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
+            var base64 = encoded.Replace('-', '+').Replace('_', '/');
+            base64 = base64.PadRight(base64.Length + (4 - base64.Length % 4) % 4, '=');
+            var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(base64));
             return System.Text.Json.JsonSerializer.Deserialize<NostrEvent>(json);
         }
         catch (Exception)
@@ -413,6 +484,7 @@ public class UINostrLoginController : Controller
             AllowAutoUserCreation = settings.AllowAutoUserCreation,
             Relays = settings.Relays is { Count: > 0 } ? string.Join("\n", settings.Relays) : "",
             EnableDiagnosticLogging = settings.EnableDiagnosticLogging,
+            SyncProfilePictures = settings.SyncProfilePictures,
             LinkedKeyCount = (await GetUserMap()).PubkeyToUserId.Count,
             DefaultRelays = NostrLoginService.DefaultRelays
         });
@@ -441,6 +513,7 @@ public class UINostrLoginController : Controller
         settings.AllowAutoUserCreation = model.AllowAutoUserCreation;
         settings.Relays = relays.Count > 0 ? relays : null;
         settings.EnableDiagnosticLogging = model.EnableDiagnosticLogging;
+        settings.SyncProfilePictures = model.SyncProfilePictures;
         await _settingsRepository.UpdateSetting(settings);
         TempData[BTCPayServer.Abstractions.Constants.WellKnownTempData.SuccessMessage] = "Nostr Login settings updated.";
         return RedirectToAction(nameof(ServerSettings));
