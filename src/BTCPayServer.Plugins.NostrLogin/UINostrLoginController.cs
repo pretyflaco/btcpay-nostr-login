@@ -55,6 +55,7 @@ public class NostrLoginServerSettingsViewModel
 public class UINostrLoginController : Controller
 {
     private readonly NostrLoginService _nostrLoginService;
+    private readonly Nip98ReplayStore _replayStore;
     private readonly NostrProfilePictureService _profilePictureService;
     private readonly SignInManager<ApplicationUser> _signInManager;
     private readonly UserManager<ApplicationUser> _userManager;
@@ -64,6 +65,7 @@ public class UINostrLoginController : Controller
 
     public UINostrLoginController(
         NostrLoginService nostrLoginService,
+        Nip98ReplayStore replayStore,
         NostrProfilePictureService profilePictureService,
         SignInManager<ApplicationUser> signInManager,
         UserManager<ApplicationUser> userManager,
@@ -72,6 +74,7 @@ public class UINostrLoginController : Controller
         PoliciesSettings policiesSettings)
     {
         _nostrLoginService = nostrLoginService;
+        _replayStore = replayStore;
         _profilePictureService = profilePictureService;
         _signInManager = signInManager;
         _userManager = userManager;
@@ -272,7 +275,8 @@ public class UINostrLoginController : Controller
 
         // expectedNonce = null: no prior session, so the signature + URL binding + replay guard are
         // the gate. The `u` tag must equal this endpoint's public URL.
-        var error = Nip98.Validate(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "POST", null);
+        var error = await Nip98.ValidateAsync(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "POST", null,
+            tryConsume: _replayStore.TryConsumeAsync);
         if (error is not null)
             return Unauthorized(new { status = "failed", error });
 
@@ -321,8 +325,8 @@ public class UINostrLoginController : Controller
         // expectedNonce = null: no prior session (same open posture as the POST endpoint). The
         // `u` tag must equal this endpoint's public URL and the method tag must be GET. Tight
         // 90 s freshness because the proof travels in a URL (audit finding 7).
-        var error = Nip98.Validate(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "GET", null,
-            Nip98.GetLinkMaxAgeMinutes);
+        var error = await Nip98.ValidateAsync(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "GET", null,
+            Nip98.GetLinkMaxAgeMinutes, _replayStore.TryConsumeAsync);
         if (error is not null)
             return Unauthorized(new { status = "failed", error });
 

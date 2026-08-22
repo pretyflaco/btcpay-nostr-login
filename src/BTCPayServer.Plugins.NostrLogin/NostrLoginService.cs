@@ -101,10 +101,12 @@ public class NostrLoginService : IDisposable
     private readonly ConcurrentDictionary<string, Nip46Session> _sessions = new();
     private readonly ConcurrentDictionary<string, (int Count, DateTimeOffset WindowStart)> _rateLimit = new();
     private readonly ILogger<NostrLoginService> _logger;
+    private readonly Nip98ReplayStore? _replayStore;
 
-    public NostrLoginService(ILogger<NostrLoginService> logger)
+    public NostrLoginService(ILogger<NostrLoginService> logger, Nip98ReplayStore? replayStore = null)
     {
         _logger = logger;
+        _replayStore = replayStore;
     }
 
     /// <summary>
@@ -578,9 +580,13 @@ public class NostrLoginService : IDisposable
                     return;
                 }
 
-                var error = scheme == AuthScheme.Nip98
-                    ? Nip98.Validate(signed, userPubkey!, loginUrl ?? "", "POST", session.Nip98Nonce)
-                    : ValidateSignedEvent(signed, userPubkey!, session.Challenge22242!);
+                string? error;
+                if (scheme == AuthScheme.Nip98)
+                    error = await Nip98.ValidateAsync(signed, userPubkey!, loginUrl ?? "", "POST",
+                        session.Nip98Nonce,
+                        tryConsume: _replayStore is null ? null : _replayStore.TryConsumeAsync);
+                else
+                    error = ValidateSignedEvent(signed, userPubkey!, session.Challenge22242!);
                 if (error is not null)
                 {
                     Fail(session, error, diagnostics);

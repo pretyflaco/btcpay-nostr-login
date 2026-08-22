@@ -40,7 +40,7 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98();
-        Assert.Null(Nip98.Validate(evt, pubkey, Url, "POST", Nonce));
+        Assert.Null(await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce));
     }
 
     [Fact]
@@ -49,13 +49,13 @@ public class Nip98ValidatorTests
         Nip98.ResetReplayStoreForTest();
         // Open endpoint: no session nonce. An event that carries no challenge tag is fine.
         var (evt, pubkey) = await SignNip98(nonce: null);
-        Assert.Null(Nip98.Validate(evt, pubkey, Url, "POST", null));
+        Assert.Null(await Nip98.ValidateAsync(evt, pubkey, Url, "POST", null));
     }
 
     [Fact]
-    public void RejectsNullEvent()
+    public async Task RejectsNullEvent()
     {
-        Assert.NotNull(Nip98.Validate(null, "pubkey", Url, "POST", null));
+        Assert.NotNull(await Nip98.ValidateAsync(null, "pubkey", Url, "POST", null));
     }
 
     [Fact]
@@ -63,7 +63,7 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98(kind: 1);
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", Nonce);
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce);
         Assert.NotNull(error);
         Assert.Contains("kind", error, StringComparison.OrdinalIgnoreCase);
     }
@@ -75,7 +75,7 @@ public class Nip98ValidatorTests
         var (evt, _) = await SignNip98();
         var otherKey = NostrExtensions.ParseKey(RandomNumberGenerator.GetBytes(32));
         var otherPubkey = otherKey.CreateXOnlyPubKey().ToHex();
-        var error = Nip98.Validate(evt, otherPubkey, Url, "POST", Nonce);
+        var error = await Nip98.ValidateAsync(evt, otherPubkey, Url, "POST", Nonce);
         Assert.NotNull(error);
         Assert.Contains("pubkey", error, StringComparison.OrdinalIgnoreCase);
     }
@@ -85,7 +85,7 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98(url: "https://evil.example/login/nostr/nip98");
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", Nonce);
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce);
         Assert.NotNull(error);
         Assert.Contains("URL", error, StringComparison.OrdinalIgnoreCase);
     }
@@ -95,7 +95,7 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98(method: "GET");
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", Nonce);
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce);
         Assert.NotNull(error);
         Assert.Contains("method", error, StringComparison.OrdinalIgnoreCase);
     }
@@ -105,7 +105,7 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98();
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", "ffffffffffffffffffffffffffffffff");
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", "ffffffffffffffffffffffffffffffff");
         Assert.NotNull(error);
         Assert.Contains("challenge", error, StringComparison.OrdinalIgnoreCase);
     }
@@ -115,7 +115,7 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98(createdAt: DateTimeOffset.UtcNow.AddMinutes(-30));
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", Nonce);
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce);
         Assert.NotNull(error);
         Assert.Contains("timestamp", error, StringComparison.OrdinalIgnoreCase);
     }
@@ -125,7 +125,7 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98(createdAt: DateTimeOffset.UtcNow.AddMinutes(30));
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", Nonce);
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce);
         Assert.NotNull(error);
         Assert.Contains("timestamp", error, StringComparison.OrdinalIgnoreCase);
     }
@@ -136,7 +136,7 @@ public class Nip98ValidatorTests
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98();
         evt.Content += " tampered"; // id/sig no longer match
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", Nonce);
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce);
         Assert.NotNull(error);
     }
 
@@ -145,8 +145,8 @@ public class Nip98ValidatorTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignNip98();
-        Assert.Null(Nip98.Validate(evt, pubkey, Url, "POST", Nonce));      // first use ok
-        var second = Nip98.Validate(evt, pubkey, Url, "POST", Nonce);      // same id again
+        Assert.Null(await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce));      // first use ok
+        var second = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", Nonce);      // same id again
         Assert.NotNull(second);
         Assert.Contains("replay", second, StringComparison.OrdinalIgnoreCase);
     }

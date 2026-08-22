@@ -75,7 +75,7 @@ public class Nip98LoginLinkTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignGetEvent();
-        Assert.Null(Nip98.Validate(evt, pubkey, Url, "GET", null));
+        Assert.Null(await Nip98.ValidateAsync(evt, pubkey, Url, "GET", null));
     }
 
     [Fact]
@@ -83,7 +83,7 @@ public class Nip98LoginLinkTests
     {
         Nip98.ResetReplayStoreForTest();
         var (evt, pubkey) = await SignGetEvent();
-        var error = Nip98.Validate(evt, pubkey, Url, "POST", null);
+        var error = await Nip98.ValidateAsync(evt, pubkey, Url, "POST", null);
         Assert.NotNull(error);
         Assert.Contains("method", error, StringComparison.OrdinalIgnoreCase);
     }

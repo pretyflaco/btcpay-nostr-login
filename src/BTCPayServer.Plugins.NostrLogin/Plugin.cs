@@ -14,6 +14,9 @@ public class Plugin : BaseBTCPayServerPlugin
     public override void Execute(IServiceCollection services)
     {
         services.AddSingleton<NostrLoginService>();
+        // Durable NIP-98 replay guard (audit finding 5): consumed event ids survive restarts.
+        services.AddSingleton<Nip98ReplayStore>();
+        services.AddHostedService<Nip98ReplayStore>(sp => sp.GetRequiredService<Nip98ReplayStore>());
         services.AddSingleton<NostrProfilePictureService>();
         services.AddHttpClient();
         // SSRF-guarded client for attacker-chosen avatar URLs (audit finding 4): every

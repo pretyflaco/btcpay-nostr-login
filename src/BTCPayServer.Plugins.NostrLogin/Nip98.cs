@@ -20,6 +20,10 @@ internal static class Nip98
     internal const int Kind = 27235;
     private const int MaxAgeMinutes = 10;
 
+    /// <summary>How long a consumed event id must be remembered: the full window an event
+    /// could still be accepted (freshness + future tolerance).</summary>
+    internal static readonly TimeSpan ReplayRetention = TimeSpan.FromMinutes(MaxAgeMinutes) + FutureTolerance;
+
     /// <summary>Much shorter window for the GET magic-link variant: the proof travels in a URL
     /// (server logs, proxies, browser history), so its usable lifetime is deliberately tight
     /// (audit finding 7). Signer apps mint the link on tap, so 90 s is ample.</summary>
@@ -41,8 +45,22 @@ internal static class Nip98
     /// </param>
     /// <param name="maxAgeMinutes">Freshness window in minutes; defaults to the standard 10.
     /// Callers carrying a proof in a URL (GET magic link) pass a much tighter value.</param>
-    internal static string? Validate(NostrEvent? signed, string expectedPubkey, string expectedUrl,
-        string expectedMethod, string? expectedNonce, double maxAgeMinutes = MaxAgeMinutes)
+    /// <param name="tryConsume">
+    /// Replay-guard sink. Defaults to the built-in memory-only dictionary (used by tests);
+    /// production callers pass <see cref="Nip98ReplayStore.TryConsumeAsync"/> so consumption
+    /// survives restarts (audit finding 5).
+    /// </param>
+    internal static Task<string?> ValidateAsync(NostrEvent? signed, string expectedPubkey, string expectedUrl,
+        string expectedMethod, string? expectedNonce, double maxAgeMinutes = MaxAgeMinutes,
+        Func<string, Task<bool>>? tryConsume = null)
+    {
+        return ValidateCore(signed, expectedPubkey, expectedUrl, expectedMethod,
+            expectedNonce, maxAgeMinutes, tryConsume);
+    }
+
+    private static async Task<string?> ValidateCore(NostrEvent? signed, string expectedPubkey, string expectedUrl,
+        string expectedMethod, string? expectedNonce, double maxAgeMinutes,
+        Func<string, Task<bool>>? tryConsume)
     {
         if (signed is null)
             return "Signer returned an invalid event.";
@@ -71,7 +89,8 @@ internal static class Nip98
             return "Signed event has an invalid signature.";
 
         // Replay guard LAST: only record a fully-valid id so bogus ids can't poison the store.
-        if (string.IsNullOrEmpty(signed.Id) || !TryConsume(signed.Id))
+        var consume = tryConsume ?? (id => Task.FromResult(TryConsume(id, maxAgeMinutes)));
+        if (string.IsNullOrEmpty(signed.Id) || !await consume(signed.Id))
             return "Signed event already used (replay rejected).";
 
         return null;
@@ -97,7 +116,7 @@ internal static class Nip98
         return $"{scheme}://{authority}{path}{u.Query}";
     }
 
-    private static bool TryConsume(string id)
+    private static bool TryConsume(string id, double maxAgeMinutes = MaxAgeMinutes)
     {
         var now = DateTimeOffset.UtcNow;
         // Opportunistic prune (cheap; the store stays tiny at login scale).
@@ -105,7 +124,7 @@ internal static class Nip98
             if (kv.Value <= now)
                 Consumed.TryRemove(kv.Key, out _);
         return Consumed.TryAdd(id.ToLowerInvariant(),
-            now + TimeSpan.FromMinutes(MaxAgeMinutes) + FutureTolerance);
+            now + TimeSpan.FromMinutes(maxAgeMinutes) + FutureTolerance);
     }
 
     /// <summary>Test-only: clear the replay store so cases don't leak state into one another.</summary>
