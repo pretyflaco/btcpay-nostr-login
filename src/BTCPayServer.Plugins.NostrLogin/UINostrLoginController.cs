@@ -103,26 +103,12 @@ public class UINostrLoginController : Controller
     private string InstanceAppName() => $"BTCPay Server ({Request.Host})";
 
     /// <summary>
-    /// The absolute URL the NIP-98 <c>u</c> tag is bound to (and the real open login endpoint). Built
-    /// from the request's public scheme/host so it matches what the browser reached — and, in turn,
-    /// what the signer origin-binds against.
+    /// The absolute URL the NIP-98 <c>u</c> tag is bound to (and the real open login endpoint).
+    /// Uses Request.Scheme/Host, which reflect the reverse proxy through BTCPay core's configured
+    /// ForwardedHeaders middleware (Startup.cs) — deliberately NOT raw X-Forwarded-* headers,
+    /// which a proxy passing client input through could spoof (audit finding 6).
     /// </summary>
-    private string Nip98LoginUrl() => $"{PublicScheme()}://{PublicHost()}/login/nostr/nip98";
-
-    /// <summary>
-    /// Public scheme as seen by the client, honouring the reverse proxy BTCPay sits behind
-    /// (<c>X-Forwarded-Proto</c>) with a safe fallback to the request's own scheme.
-    /// </summary>
-    private string PublicScheme() =>
-        Request.Headers.TryGetValue("X-Forwarded-Proto", out var proto) && !string.IsNullOrEmpty(proto)
-            ? proto.ToString().Split(',')[0].Trim()
-            : Request.Scheme;
-
-    /// <summary>Public host as seen by the client (<c>X-Forwarded-Host</c> then <c>Host</c>).</summary>
-    private string PublicHost() =>
-        Request.Headers.TryGetValue("X-Forwarded-Host", out var host) && !string.IsNullOrEmpty(host)
-            ? host.ToString().Split(',')[0].Trim()
-            : Request.Host.ToString();
+    private string Nip98LoginUrl() => $"{Request.Scheme}://{Request.Host}/login/nostr/nip98";
 
     private NostrLoginViewModel ToViewModel(Nip46Session session, string statusUrl, string? returnUrl = null)
     {
@@ -314,8 +300,9 @@ public class UINostrLoginController : Controller
     ///
     /// SECURITY: same posture as the POST endpoint (no QR browser-binding — by design; the gate
     /// is the full NIP-98 proof + per-IP rate limiting). The event travels in a URL (server logs,
-    /// browser history), which is acceptable because it is single-use (replay guard), freshness
-    /// windowed (10 min), and URL/method-bound. The redirect drops the query immediately.
+    /// browser history), which is acceptable because it is single-use (replay guard), tightly
+    /// freshness-windowed (90 s, audit finding 7), and URL/method-bound. The redirect drops the
+    /// query immediately.
     /// </summary>
     [AllowAnonymous]
     [HttpGet("/login/nostr/nip98")]
@@ -332,8 +319,10 @@ public class UINostrLoginController : Controller
             return Unauthorized(new { status = "failed", error = "Missing or malformed event parameter." });
 
         // expectedNonce = null: no prior session (same open posture as the POST endpoint). The
-        // `u` tag must equal this endpoint's public URL and the method tag must be GET.
-        var error = Nip98.Validate(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "GET", null);
+        // `u` tag must equal this endpoint's public URL and the method tag must be GET. Tight
+        // 90 s freshness because the proof travels in a URL (audit finding 7).
+        var error = Nip98.Validate(signed, signed.PublicKey ?? "", Nip98LoginUrl(), "GET", null,
+            Nip98.GetLinkMaxAgeMinutes);
         if (error is not null)
             return Unauthorized(new { status = "failed", error });
 
