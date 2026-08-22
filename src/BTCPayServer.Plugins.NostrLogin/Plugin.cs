@@ -16,6 +16,10 @@ public class Plugin : BaseBTCPayServerPlugin
         services.AddSingleton<NostrLoginService>();
         services.AddSingleton<NostrProfilePictureService>();
         services.AddHttpClient();
+        // SSRF-guarded client for attacker-chosen avatar URLs (audit finding 4): every
+        // connection resolves DNS itself and refuses private/link-local targets.
+        services.AddHttpClient(NostrProfilePictureService.GuardedHttpClientName)
+            .ConfigurePrimaryHttpMessageHandler(() => NostrProfilePictureService.CreateGuardedHandler());
         services.AddSingleton<Microsoft.AspNetCore.Hosting.IStartupFilter, NostrLoginStartupFilter>();
         services.AddUIExtension("user-nav", "/Views/NostrLogin/UserNav.cshtml");
         services.AddUIExtension("server-nav", "/Views/NostrLogin/ServerNav.cshtml");

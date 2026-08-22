@@ -1,7 +1,9 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using BTCPayServer.Abstractions.Contracts;
@@ -219,7 +221,8 @@ public class NostrProfilePictureService
     {
         try
         {
-            var http = services.GetRequiredService<IHttpClientFactory>().CreateClient();
+            var http = services.GetRequiredService<IHttpClientFactory>()
+                .CreateClient(GuardedHttpClientName);
             using var cts = new CancellationTokenSource(DownloadTimeout);
             using var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cts.Token);
             if (!resp.IsSuccessStatusCode)
@@ -245,5 +248,89 @@ public class NostrProfilePictureService
         {
             return null;
         }
+    }
+
+    public const string GuardedHttpClientName = "NostrAvatarGuarded";
+
+    /// <summary>
+    /// HttpClient handler for fetching attacker-chosen picture URLs (audit finding 4): a
+    /// ConnectCallback resolves DNS itself and refuses to open ANY connection whose resolved
+    /// endpoint is loopback, private, link-local, CGNAT, ULA or IPv4-mapped. The callback runs
+    /// per connection attempt, so redirects and DNS-rebinding re-resolution are re-checked.
+    /// </summary>
+    public static HttpMessageHandler CreateGuardedHandler() =>
+        new SocketsHttpHandler
+        {
+            AllowAutoRedirect = true,
+            ConnectTimeout = DownloadTimeout,
+            ConnectCallback = async (ctx, ct) =>
+            {
+                var host = ctx.DnsEndPoint.Host;
+                IPAddress[] endpoints;
+                if (IPAddress.TryParse(host, out var literal))
+                {
+                    AssertPublicIp(literal);
+                    endpoints = [literal];
+                }
+                else
+                {
+                    endpoints = await System.Net.Dns.GetHostAddressesAsync(host, ct);
+                    if (endpoints.Length == 0)
+                        throw new HttpRequestException($"DNS resolved '{host}' to no addresses.");
+                    foreach (var ip in endpoints)
+                        AssertPublicIp(ip);
+                }
+
+                // Prefer IPv4 among the already-vetted endpoints.
+                var target = endpoints.FirstOrDefault(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                             ?? endpoints[0];
+                var socket = new System.Net.Sockets.Socket(target.AddressFamily,
+                    System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+                try
+                {
+                    await socket.ConnectAsync(target, ctx.DnsEndPoint.Port, ct);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            }
+        };
+
+    private static void AssertPublicIp(IPAddress ip)
+    {
+        if (IsBlocked(ip))
+            throw new HttpRequestException($"Refusing to fetch from non-public address {ip} (SSRF guard).");
+    }
+
+    internal static bool IsBlocked(IPAddress ip)
+    {
+        if (ip.IsIPv4MappedToIPv6)
+            ip = ip.MapToIPv4();
+        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            var b = ip.GetAddressBytes();
+            return b[0] == 127                                  // loopback
+                || b[0] == 10                                   // private
+                || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)    // private
+                || (b[0] == 192 && b[1] == 168)                 // private
+                || (b[0] == 169 && b[1] == 254)                 // link-local (cloud metadata)
+                || (b[0] == 100 && b[1] >= 64 && b[1] <= 127)   // CGNAT
+                || b[0] == 0                                    // unspecified / this-network
+                || b[0] >= 224;                                 // multicast + reserved + broadcast
+        }
+        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+        {
+            if (ip.Equals(System.Net.IPAddress.IPv6Loopback)) return true;
+            if (ip.Equals(System.Net.IPAddress.IPv6None)) return true;
+            var b = ip.GetAddressBytes();
+            // fc00::/7 unique-local; fe80::/10 link-local; ff00::/8 multicast
+            return (b[0] & 0xFE) == 0xFC
+                || (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
+                || b[0] == 0xFF;
+        }
+        return false;
     }
 }
