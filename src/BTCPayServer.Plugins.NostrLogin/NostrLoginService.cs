@@ -115,6 +115,7 @@ public class NostrLoginService : IDisposable
     /// </summary>
     private bool AllowLoginAttempt(string rateLimitKey)
     {
+        Cleanup(); // sweep on every attempt too: the open POST/GET endpoints never create sessions (audit finding 10)
         var now = DateTimeOffset.UtcNow;
         var updated = _rateLimit.AddOrUpdate(
             rateLimitKey,

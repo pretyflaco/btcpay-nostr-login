@@ -138,8 +138,8 @@ public class NostrProfilePictureService
         if (!result.Succeeded)
             return;
 
-        avatarMap.UserIdToSourceUrl[userId] = sourceUrl;
-        await settingsRepository.UpdateSetting(avatarMap);
+        await SettingsMapMutex.UpdateAsync<NostrLoginAvatarMap>(settingsRepository,
+            m => m.UserIdToSourceUrl[userId] = sourceUrl);
         _logger.LogInformation("NostrLogin: synced Nostr profile picture for user {UserId}", userId);
     }
 

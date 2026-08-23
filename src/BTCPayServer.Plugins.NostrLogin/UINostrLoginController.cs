@@ -106,6 +106,18 @@ public class UINostrLoginController : Controller
     private string InstanceAppName() => $"BTCPay Server ({Request.Host})";
 
     /// <summary>
+    /// Rate-limit key: client IP when available; else the authenticated principal's id; the
+    /// shared "unknown" bucket only as a last resort (audit finding 10 — a null IP used to
+    /// collapse everyone behind it into one bucket). Note BTCPay core trusts all proxies'
+    /// X-Forwarded-For, so header rotation can still diversify keys; that is host-level
+    /// configuration, out of plugin control.
+    /// </summary>
+    private string RateLimitKey() =>
+        HttpContext.Connection.RemoteIpAddress?.ToString()
+        ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+        ?? "unknown";
+
+    /// <summary>
     /// The absolute URL the NIP-98 <c>u</c> tag is bound to (and the real open login endpoint).
     /// Uses Request.Scheme/Host, which reflect the reverse proxy through BTCPay core's configured
     /// ForwardedHeaders middleware (Startup.cs) — deliberately NOT raw X-Forwarded-* headers,
@@ -157,7 +169,7 @@ public class UINostrLoginController : Controller
         var session = await _nostrLoginService.CreateSessionAsync(
             Nip46SessionPurpose.Login, await GetRelays(), InstanceAppName(),
             bindingNonce: bindingNonce,
-            rateLimitKey: HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            rateLimitKey: RateLimitKey(),
             appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
             diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl());
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
@@ -264,7 +276,7 @@ public class UINostrLoginController : Controller
     [HttpPost("/login/nostr/nip98")]
     public async Task<IActionResult> Nip98Login(string? returnUrl = null)
     {
-        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var ip = RateLimitKey();
         if (!_nostrLoginService.AllowLogin(ip))
             return StatusCode(StatusCodes.Status429TooManyRequests,
                 new { status = "failed", error = "Too many sign-in attempts. Please wait a moment and try again." });
@@ -313,7 +325,7 @@ public class UINostrLoginController : Controller
     public async Task<IActionResult> Nip98LoginLink([FromQuery(Name = "event")] string? eventParam,
         string? returnUrl = null)
     {
-        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var ip = RateLimitKey();
         if (!_nostrLoginService.AllowLogin(ip))
             return StatusCode(StatusCodes.Status429TooManyRequests,
                 new { status = "failed", error = "Too many sign-in attempts. Please wait a moment and try again." });
@@ -444,8 +456,8 @@ public class UINostrLoginController : Controller
             _nostrLoginService.RemoveSession(session.Id);
             return Json(new { status = "failed", error = "This Nostr key is already linked to another account." });
         }
-        map.PubkeyToUserId[pubkey] = user.Id;
-        await _settingsRepository.UpdateSetting(map);
+        await SettingsMapMutex.UpdateAsync<NostrLoginUserMap>(_settingsRepository,
+            m => m.PubkeyToUserId[pubkey] = user.Id);
         _nostrLoginService.RemoveSession(session.Id);
 
         return Json(new { status = "approved", redirect = Url.Action(nameof(Account)) });
@@ -461,8 +473,12 @@ public class UINostrLoginController : Controller
         var map = await GetUserMap();
         if (map.PubkeyToUserId.TryGetValue(pubkey, out var ownerId) && ownerId == user.Id)
         {
-            map.PubkeyToUserId.Remove(pubkey);
-            await _settingsRepository.UpdateSetting(map);
+            await SettingsMapMutex.UpdateAsync<NostrLoginUserMap>(_settingsRepository,
+                m => m.PubkeyToUserId.Remove(pubkey));
+            // Purge the avatar-map row this pubkey left behind (audit finding 11) so a stale
+            // source URL cannot suppress a future re-sync for a different identity.
+            await SettingsMapMutex.UpdateAsync<NostrLoginAvatarMap>(_settingsRepository,
+                m => m.UserIdToSourceUrl.Remove(user.Id));
         }
         return RedirectToAction(nameof(Account));
     }
@@ -552,9 +568,8 @@ public class UINostrLoginController : Controller
         var result = await _userManager.CreateAsync(user, password);
         if (!result.Succeeded)
             return (null, "Could not create a new account for this Nostr key.");
-        var map = await GetUserMap();
-        map.PubkeyToUserId[pubkey] = user.Id;
-        await _settingsRepository.UpdateSetting(map);
+        await SettingsMapMutex.UpdateAsync<NostrLoginUserMap>(_settingsRepository,
+            m => m.PubkeyToUserId[pubkey] = user.Id);
         // With RequiresUserApproval the subsequent CanLogin check reports the pending state.
         return (user, null);
     }
