@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using NNostr.Client;
 using NNostr.Client.Protocols;
 using QRCoder;
@@ -62,6 +63,7 @@ public class UINostrLoginController : Controller
     private readonly UserService _userService;
     private readonly ISettingsRepository _settingsRepository;
     private readonly PoliciesSettings _policiesSettings;
+    private readonly ILogger<UINostrLoginController> _logger;
 
     public UINostrLoginController(
         NostrLoginService nostrLoginService,
@@ -71,7 +73,8 @@ public class UINostrLoginController : Controller
         UserManager<ApplicationUser> userManager,
         UserService userService,
         ISettingsRepository settingsRepository,
-        PoliciesSettings policiesSettings)
+        PoliciesSettings policiesSettings,
+        ILogger<UINostrLoginController> logger)
     {
         _nostrLoginService = nostrLoginService;
         _replayStore = replayStore;
@@ -81,15 +84,18 @@ public class UINostrLoginController : Controller
         _userService = userService;
         _settingsRepository = settingsRepository;
         _policiesSettings = policiesSettings;
+        _logger = logger;
     }
 
     // M2: cookie that binds a login session to the browser that rendered its QR (anti-QRLjacking).
     private const string BindCookieName = "NostrLogin.Bind";
 
-    private async Task<string[]> GetRelays()
+    private async Task<(string[] Relays, bool FromSettings)> GetRelays()
     {
         var settings = await _settingsRepository.GetSettingAsync<NostrLoginSettings>() ?? new NostrLoginSettings();
-        return settings.Relays is { Count: > 0 } ? settings.Relays.ToArray() : NostrLoginService.DefaultRelays;
+        return settings.Relays is { Count: > 0 }
+            ? (settings.Relays.ToArray(), true)
+            : (NostrLoginService.DefaultRelays, false);
     }
 
     private async Task<bool> GetDiagnosticsEnabled()
@@ -116,6 +122,16 @@ public class UINostrLoginController : Controller
         HttpContext.Connection.RemoteIpAddress?.ToString()
         ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
         ?? "unknown";
+
+    /// <summary>
+    /// Origin class for the probe counter: onion traffic arrives via the Tor docker proxy (the
+    /// real source is unknowable), so it is one bucket keyed by the .onion Host; clearnet is
+    /// keyed per client IP like the rate limiter.
+    /// </summary>
+    private string OriginKey() =>
+        Request.Host.Host.EndsWith(".onion", StringComparison.OrdinalIgnoreCase)
+            ? "onion"
+            : "clearnet:" + RateLimitKey();
 
     /// <summary>
     /// The absolute URL the NIP-98 <c>u</c> tag is bound to (and the real open login endpoint).
@@ -166,12 +182,14 @@ public class UINostrLoginController : Controller
             MaxAge = TimeSpan.FromMinutes(10)
         });
 
+        var (relays, relaysFromSettings) = await GetRelays();
         var session = await _nostrLoginService.CreateSessionAsync(
-            Nip46SessionPurpose.Login, await GetRelays(), InstanceAppName(),
+            Nip46SessionPurpose.Login, relays, InstanceAppName(),
             bindingNonce: bindingNonce,
             rateLimitKey: RateLimitKey(),
             appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
-            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl());
+            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl(),
+            relaysFromSettings: relaysFromSettings, originKey: OriginKey());
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
     }
@@ -211,7 +229,13 @@ public class UINostrLoginController : Controller
 
         var (user, resolveError) = await ResolveOrCreateUser(session.UserPubkey!);
         if (user is null)
+        {
+            // The auth event verified but the key maps to no account: a stranger/prober, not a
+            // member. Distinct warn so forensics can tell the two apart at a glance.
+            _logger.LogWarning("NostrLogin session {SessionId}: verified but no linked user for pubkey {PubkeyPrefix}",
+                session.Id, NostrLoginService.TruncatePubkey(session.UserPubkey));
             return Json(new { status = "failed", error = resolveError });
+        }
 
         if (!CanLoginOk(user, out var loginError))
             return Json(new { status = "failed", error = loginError });
@@ -219,6 +243,7 @@ public class UINostrLoginController : Controller
         _profilePictureService.SyncInBackground(user.Id, session.UserPubkey!);
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
+        _logger.LogInformation("NostrLogin session {SessionId}: approved for user {UserId}", session.Id, user.Id);
         _nostrLoginService.RemoveSession(session.Id); // single use, removed only after success
         Response.Cookies.Delete(BindCookieName);
         var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
@@ -292,9 +317,15 @@ public class UINostrLoginController : Controller
         if (error is not null)
             return Unauthorized(new { status = "failed", error });
 
+        _logger.LogInformation("NostrLogin NIP-98 login: auth event verified for pubkey {PubkeyPrefix} (scheme=Nip98)",
+            NostrLoginService.TruncatePubkey(signed.PublicKey));
         var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
         if (user is null)
+        {
+            _logger.LogWarning("NostrLogin NIP-98 login: verified but no linked user for pubkey {PubkeyPrefix}",
+                NostrLoginService.TruncatePubkey(signed.PublicKey));
             return Json(new { status = "failed", error = resolveError });
+        }
 
         if (!CanLoginOk(user, out var loginError))
             return Json(new { status = "failed", error = loginError });
@@ -302,6 +333,7 @@ public class UINostrLoginController : Controller
         _profilePictureService.SyncInBackground(user.Id, signed.PublicKey!);
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
+        _logger.LogInformation("NostrLogin NIP-98 login: approved for user {UserId}", user.Id);
         var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
         return Json(new { status = "approved", redirect });
     }
@@ -342,9 +374,15 @@ public class UINostrLoginController : Controller
         if (error is not null)
             return Unauthorized(new { status = "failed", error });
 
+        _logger.LogInformation("NostrLogin NIP-98 login link: auth event verified for pubkey {PubkeyPrefix} (scheme=Nip98)",
+            NostrLoginService.TruncatePubkey(signed.PublicKey));
         var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
         if (user is null)
+        {
+            _logger.LogWarning("NostrLogin NIP-98 login link: verified but no linked user for pubkey {PubkeyPrefix}",
+                NostrLoginService.TruncatePubkey(signed.PublicKey));
             return Json(new { status = "failed", error = resolveError });
+        }
 
         if (!CanLoginOk(user, out var loginError))
             return Json(new { status = "failed", error = loginError });
@@ -352,6 +390,7 @@ public class UINostrLoginController : Controller
         _profilePictureService.SyncInBackground(user.Id, signed.PublicKey!);
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
+        _logger.LogInformation("NostrLogin NIP-98 login link: approved for user {UserId}", user.Id);
         return LocalRedirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
     }
 
@@ -423,10 +462,12 @@ public class UINostrLoginController : Controller
         var user = await _userManager.GetUserAsync(User);
         if (user is null)
             return NotFound();
+        var (relays, relaysFromSettings) = await GetRelays();
         var session = await _nostrLoginService.CreateSessionAsync(
-            Nip46SessionPurpose.Link, await GetRelays(), InstanceAppName(), user.Id,
+            Nip46SessionPurpose.Link, relays, InstanceAppName(), user.Id,
             appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
-            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl());
+            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl(),
+            relaysFromSettings: relaysFromSettings);
         return RedirectToAction(nameof(Account), new { linkSession = session.Id });
     }
 

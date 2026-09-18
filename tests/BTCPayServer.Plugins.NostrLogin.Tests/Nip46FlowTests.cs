@@ -4,7 +4,7 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Web;
 using BTCPayServer.Plugins.NostrLogin;
-using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using NNostr.Client;
 using NNostr.Client.Protocols;
 
@@ -69,7 +69,8 @@ public class Nip46FlowTests
 
         var relays = new[] { relay };
         const string loginUrl = "https://btcpay.test/login/nostr/nip98";
-        var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
+        var logger = new ListLogger<NostrLoginService>();
+        var service = new NostrLoginService(logger);
         var session = await service.CreateSessionAsync(Nip46SessionPurpose.Login, relays, "NostrLoginTest",
             loginUrl: loginUrl);
 
@@ -159,6 +160,24 @@ public class Nip46FlowTests
             return false;
 
         Assert.Equal(signerPubkeyHex, session.UserPubkey);
+
+        // Observability: the signer pubkey must be logged at first hello (earliest identity
+        // signal, even if auth later fails), and approval must log "auth event verified" — the
+        // pubkey→user mapping outcome is logged separately by the controller. The status flip
+        // and the log line race, so give the logger a moment to catch up.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            var infos = logger.At(LogLevel.Information).ToList();
+            var hello = infos.Any(m => m.Contains("signer hello from pubkey") && m.Contains(signerPubkeyHex[..8]));
+            var verified = infos.Any(m => m.Contains("auth event verified for pubkey") && m.Contains(signerPubkeyHex[..8]));
+            if (hello && verified)
+                return true;
+            await Task.Delay(100);
+        }
+        var missing = logger.At(LogLevel.Information).ToList();
+        Assert.Contains(missing, m => m.Contains("signer hello from pubkey") && m.Contains(signerPubkeyHex[..8]));
+        Assert.Contains(missing, m => m.Contains("auth event verified for pubkey") && m.Contains(signerPubkeyHex[..8]));
         return true;
     }
 }
