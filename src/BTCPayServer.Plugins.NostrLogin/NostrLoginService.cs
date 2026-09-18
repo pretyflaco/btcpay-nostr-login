@@ -64,6 +64,21 @@ public class Nip46Session
     /// </summary>
     public string? BindingNonce { get; init; }
 
+    /// <summary>
+    /// Origin classification for the probe counter ("onion" / "clearnet:{ip}"), set by the
+    /// controller from the request. Null in tests / non-HTTP callers.
+    /// </summary>
+    internal string? OriginKey { get; init; }
+
+    /// <summary>
+    /// x-only pubkey (hex) of the first signer that sent a decryptable kind-24133 RPC, set the
+    /// moment the hello arrives — even when auth subsequently fails (probe vs member forensics).
+    /// </summary>
+    internal string? SignerHelloPubkey { get; set; }
+
+    /// <summary>Relays connected at session start (-1 = connect phase never completed).</summary>
+    internal int RelaysConnected { get; set; } = -1;
+
     internal CancellationTokenSource Cts { get; } = new();
 }
 
@@ -98,8 +113,16 @@ public class NostrLoginService : IDisposable
     private static readonly TimeSpan RateLimitWindow = TimeSpan.FromMinutes(1);
     private const int MaxLoginSessionsPerWindow = 10;
 
+    // Probe signal: login sessions that expire without any signer hello, counted per origin
+    // class ("onion" / "clearnet:{ip}"). A single warn fires when the hourly count crosses the
+    // threshold — Tor probers enumerate /login/nostr (creating sessions) without ever scanning
+    // the QR, which is otherwise indistinguishable from a user who simply closed the tab.
+    private static readonly TimeSpan ProbeWindow = TimeSpan.FromHours(1);
+    private const int ProbeAlertThreshold = 5;
+
     private readonly ConcurrentDictionary<string, Nip46Session> _sessions = new();
     private readonly ConcurrentDictionary<string, (int Count, DateTimeOffset WindowStart)> _rateLimit = new();
+    private readonly ConcurrentDictionary<string, (int Count, DateTimeOffset WindowStart)> _probelessSessions = new();
     private readonly ILogger<NostrLoginService> _logger;
     private readonly Nip98ReplayStore? _replayStore;
 
@@ -134,7 +157,8 @@ public class NostrLoginService : IDisposable
     /// </summary>
     public Task<Nip46Session> CreateSessionAsync(Nip46SessionPurpose purpose, string[] relays, string appName,
         string? linkUserId = null, string? bindingNonce = null, string? rateLimitKey = null,
-        string? appUrl = null, string? imageUrl = null, bool diagnostics = false, string? loginUrl = null)
+        string? appUrl = null, string? imageUrl = null, bool diagnostics = false, string? loginUrl = null,
+        bool relaysFromSettings = false, string? originKey = null)
     {
         Cleanup();
 
@@ -169,10 +193,15 @@ public class NostrLoginService : IDisposable
             Purpose = purpose,
             LinkUserId = linkUserId,
             ConnectUri = connectUri,
-            BindingNonce = bindingNonce
+            BindingNonce = bindingNonce,
+            OriginKey = originKey
         };
         _sessions[session.Id] = session;
         session.Cts.CancelAfter(SessionLifetime);
+
+        _logger.LogInformation(
+            "NostrLogin session {SessionId} created (purpose={Purpose}, relays=[{Relays}], relaySource={RelaySource})",
+            session.Id, purpose, string.Join(", ", relays), relaysFromSettings ? "settings" : "defaults");
 
         // Everything relay-related runs off the request thread. The QR is returned synchronously
         // below; by the time a human scans it (seconds later) the background connect has completed.
@@ -199,8 +228,12 @@ public class NostrLoginService : IDisposable
             // Connect to all relays in parallel and tolerate partial failures: one dead relay must
             // neither kill the session nor delay the others.
             var connected = await pool.ConnectAsync(ct);
+            session.RelaysConnected = connected;
             if (connected == 0)
             {
+                _logger.LogInformation(
+                    "NostrLogin session {SessionId} expired unauthenticated ({Reason})",
+                    session.Id, ExpiryRelayDead);
                 Fail(session, "Could not connect to any nostr relay.", diagnostics);
                 return;
             }
@@ -217,6 +250,18 @@ public class NostrLoginService : IDisposable
         }
         catch (OperationCanceledException)
         {
+            // The Cts fires on session-lifetime expiry AND on RemoveSession after a terminal
+            // state; only a still-Pending session is a genuine unauthenticated expiry.
+            if (session.Status == Nip46SessionStatus.Pending)
+            {
+                var reason = ClassifyUnauthenticatedExpiry(session);
+                _logger.LogInformation(
+                    "NostrLogin session {SessionId} expired unauthenticated ({Reason})", session.Id, reason);
+                // Probe counter is for anonymous login sessions; a Link session expiring is a
+                // user who changed their mind, not recon.
+                if (reason == ExpiryNoHello && session.Purpose == Nip46SessionPurpose.Login)
+                    RecordProbelessExpiry(session.OriginKey);
+            }
             Fail(session, "Timed out waiting for signer approval.", diagnostics);
         }
         catch (Exception ex)
@@ -288,6 +333,11 @@ public class NostrLoginService : IDisposable
         foreach (var (key, window) in _rateLimit)
             if (now - window.WindowStart > RateLimitWindow)
                 _rateLimit.TryRemove(key, out _);
+
+        // Same for the probe counter.
+        foreach (var (key, window) in _probelessSessions)
+            if (now - window.WindowStart > ProbeWindow)
+                _probelessSessions.TryRemove(key, out _);
     }
 
     /// <summary>
@@ -299,6 +349,46 @@ public class NostrLoginService : IDisposable
     // Exposed for unit tests.
     internal bool AllowLoginAttemptForTest(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
     internal static int MaxLoginSessionsPerWindowForTest => MaxLoginSessionsPerWindow;
+    internal void RecordProbelessExpiryForTest(string originKey) => RecordProbelessExpiry(originKey);
+    internal static int ProbeAlertThresholdForTest => ProbeAlertThreshold;
+
+    internal const string ExpiryRelayDead = "relay-dead";
+    internal const string ExpiryNoHello = "no-hello";
+    internal const string ExpiryHelloNoAuth = "hello-no-auth";
+
+    /// <summary>
+    /// Why a session ended without approval: no relay carried the handshake, no signer ever
+    /// spoke, or a signer hello arrived but the auth event never completed.
+    /// </summary>
+    internal static string ClassifyUnauthenticatedExpiry(Nip46Session session) =>
+        session.RelaysConnected <= 0 ? ExpiryRelayDead
+        : session.SignerHelloPubkey is null ? ExpiryNoHello
+        : ExpiryHelloNoAuth;
+
+    /// <summary>
+    /// Counts a session that expired without any signer hello against its origin class and
+    /// warns once when the hourly threshold is crossed. Fires exactly once per window per key
+    /// (== threshold), so a persistent prober does not spam the alert channel.
+    /// </summary>
+    private void RecordProbelessExpiry(string? originKey)
+    {
+        var key = originKey ?? "unknown";
+        var now = DateTimeOffset.UtcNow;
+        var updated = _probelessSessions.AddOrUpdate(
+            key,
+            _ => (1, now),
+            (_, current) => now - current.WindowStart > ProbeWindow
+                ? (1, now)
+                : (current.Count + 1, current.WindowStart));
+        if (updated.Count == ProbeAlertThreshold)
+            _logger.LogWarning(
+                "NostrLogin: {Count} NostrConnect sessions expired without signer contact in the last hour from {Origin}",
+                updated.Count, key);
+    }
+
+    /// <summary>First 8 hex chars of a pubkey, matching the truncation used elsewhere in logs.</summary>
+    internal static string TruncatePubkey(string? pubkey) =>
+        pubkey is { Length: > 8 } ? pubkey[..8] : pubkey ?? "?";
 
     /// <summary>
     /// Builds the nostrconnect:// URI encoding the ephemeral client pubkey, relays, one-time
@@ -492,6 +582,16 @@ public class NostrLoginService : IDisposable
             if (msg is null)
                 continue;
 
+            // Earliest identity signal: a signer sent a decryptable kind-24133 RPC. Log its
+            // pubkey immediately, even if the ack/auth subsequently fails — today a prober who
+            // scans but never completes leaves no identity trace at all.
+            if (signerPubkey is null && session.SignerHelloPubkey is null)
+            {
+                session.SignerHelloPubkey = evt.PublicKey;
+                _logger.LogInformation("NostrLogin session {SessionId}: signer hello from pubkey {PubkeyPrefix}",
+                    session.Id, TruncatePubkey(evt.PublicKey));
+            }
+
             if (signerPubkey is null)
             {
                 // Expect connect ack: result echoes our secret ("ack" for legacy signers)
@@ -597,8 +697,10 @@ public class NostrLoginService : IDisposable
                 session.UserPubkey = userPubkey;
                 session.Status = Nip46SessionStatus.Approved;
                 session.AuthUrl = null;
-                _logger.LogInformation("NostrLogin session {SessionId} approved for pubkey {Pubkey} (scheme={Scheme})",
-                    session.Id, userPubkey, scheme);
+                // "Verified" only means the signer proved key ownership — whether that key maps
+                // to a user is decided (and logged) by the controller's mapping step.
+                _logger.LogInformation("NostrLogin session {SessionId}: auth event verified for pubkey {PubkeyPrefix} (scheme={Scheme})",
+                    session.Id, TruncatePubkey(userPubkey), scheme);
                 return;
             }
         }

@@ -39,6 +39,8 @@ internal sealed class RelayPool : IDisposable
 
     // relayUrl -> live client. A relay absent from the map is currently disconnected.
     private readonly ConcurrentDictionary<string, NostrClient> _clients = new();
+    // relayUrl -> short failure reason from the initial connect (cleared on (re)connect).
+    private readonly ConcurrentDictionary<string, string> _connectFailures = new();
     private readonly Channel<NostrEvent> _events = Channel.CreateUnbounded<NostrEvent>();
 
     public RelayPool(string[] relays, string clientPubkey, ILogger logger, string sessionId, bool diagnostics)
@@ -66,7 +68,37 @@ internal sealed class RelayPool : IDisposable
     public async Task<int> ConnectAsync(CancellationToken ct)
     {
         await Task.WhenAll(_relays.Select(relay => OpenAndSubscribe(relay, ct)));
-        return _clients.Count;
+        var connected = _clients.Count;
+        // One aggregate line per session instead of one warn per failed relay: a single flaky
+        // relay (e.g. damus behind Cloudflare returning 503) used to page the alert channel for
+        // every session even though the remaining relays carry the handshake fine. Only a total
+        // outage (0 connected — the session is unusable) stays warn-level.
+        if (connected == 0)
+            _logger.LogWarning("NostrLogin session {SessionId}: connected 0/{Total} relays ({Relays}) — session unusable",
+                _sessionId, _relays.Length, AggregateRelayStatus());
+        else if (_connectFailures.Count > 0)
+            _logger.LogInformation("NostrLogin session {SessionId}: connected {Connected}/{Total} relays ({Relays})",
+                _sessionId, connected, _relays.Length, AggregateRelayStatus());
+        return connected;
+    }
+
+    /// <summary>Per-relay status for the aggregate line, e.g. "nos.lol(ok), damus(503)".</summary>
+    private string AggregateRelayStatus() =>
+        string.Join(", ", _relays.Select(relay =>
+        {
+            var host = Uri.TryCreate(relay, UriKind.Absolute, out var uri) ? uri.Host : relay;
+            return _connectFailures.TryGetValue(relay, out var reason) ? $"{host}({reason})" : $"{host}(ok)";
+        }));
+
+    /// <summary>Short failure tag for the aggregate: the HTTP status when the relay refused the
+    /// websocket upgrade ("503"), else a truncated exception message.</summary>
+    private static string ShortReason(Exception ex)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(ex.Message, @"'(\d{3})'");
+        if (match.Success)
+            return match.Groups[1].Value;
+        var msg = ex.Message.Replace('\n', ' ').Replace('\r', ' ');
+        return msg.Length <= 40 ? msg : msg[..40];
     }
 
     /// <summary>Broadcast an event to every live relay. Returns the number of relays written to.</summary>
@@ -121,17 +153,21 @@ internal sealed class RelayPool : IDisposable
                 client.Dispose();
                 return;
             }
+            _connectFailures.TryRemove(relay, out _);
             if (reconnect)
                 _logger.LogInformation("NostrLogin session {SessionId}: (re)connected relay {Relay}",
                     _sessionId, relay);
         }
         catch (Exception ex)
         {
+            // Per-relay failures are debug-level (aggregated once by ConnectAsync); only a 0/4
+            // connect is warn-worthy.
+            _connectFailures[relay] = ShortReason(ex);
             if (reconnect)
                 _logger.LogDebug("NostrLogin session {SessionId}: relay {Relay} still unavailable: {Error}",
                     _sessionId, relay, ex.Message);
             else
-                _logger.LogWarning("NostrLogin session {SessionId}: could not connect to relay {Relay}: {Error}",
+                _logger.LogDebug("NostrLogin session {SessionId}: could not connect to relay {Relay}: {Error}",
                     _sessionId, relay, ex.Message);
             client.Dispose();
         }
