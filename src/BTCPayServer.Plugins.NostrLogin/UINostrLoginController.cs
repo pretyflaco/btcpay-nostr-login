@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using BTCPayServer.Abstractions.Constants;
 using BTCPayServer.Abstractions.Extensions;
 using BTCPayServer.Abstractions.Contracts;
+using BTCPayServer.Controllers;
 using BTCPayServer.Data;
 using BTCPayServer.Services;
 using Microsoft.AspNetCore.Authorization;
@@ -237,10 +238,23 @@ public class UINostrLoginController : Controller
             return Json(new { status = "failed", error = resolveError });
         }
 
+        _profilePictureService.SyncInBackground(user.Id, session.UserPubkey!);
+
+        // 2FA hand-off BEFORE any full sign-in: the key proof alone is single-factor. The 2FA
+        // cookie is set on this (already browser-bind-verified) response, so only the QR-bound
+        // browser can proceed to the second factor. CanLogin runs in core's RedirectLoginSuccess
+        // after the second factor — the same order as the password flow.
+        if (await StartTwoFactorIfRequiredAsync(user, returnUrl) is { } secondLoginUrl)
+        {
+            _logger.LogInformation("NostrLogin session {SessionId}: user {UserId} requires 2FA; handing off to second-factor flow",
+                session.Id, user.Id);
+            _nostrLoginService.RemoveSession(session.Id); // single use, nostr leg complete
+            Response.Cookies.Delete(BindCookieName);
+            return Json(new { status = "2fa_required", redirect = secondLoginUrl });
+        }
+
         if (!CanLoginOk(user, out var loginError))
             return Json(new { status = "failed", error = loginError });
-
-        _profilePictureService.SyncInBackground(user.Id, session.UserPubkey!);
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         _logger.LogInformation("NostrLogin session {SessionId}: approved for user {UserId}", session.Id, user.Id);
@@ -271,6 +285,34 @@ public class UINostrLoginController : Controller
             : (createdUser, null);
     }
 
+    /// <summary>
+    /// 2FA gate shared by the interactive nostr sign-in paths. Possession of a nostr key is a
+    /// SINGLE possession factor — unlike a passkey there is no device binding or user-verification
+    /// gesture — so an account with two-factor enabled must never receive the auth cookie from key
+    /// proof alone (that would silently downgrade it to 1FA where password login requires 2FA).
+    ///
+    /// Instead we hand off to BTCPay core's second-factor flow, mirroring the password path in
+    /// UIAccountController: store a LoginSession (returnUrl + method continuity for
+    /// RedirectLoginSuccess), set the 2FA user-id cookie, and let the caller send the browser to
+    /// /login/second-login, where core verifies TOTP/FIDO2/LNURL and completes the sign-in itself.
+    /// Returns the second-factor URL to send the browser to, or null when the account has no 2FA
+    /// configured (no-op; the caller proceeds to full sign-in).
+    /// </summary>
+    private async Task<string?> StartTwoFactorIfRequiredAsync(ApplicationUser user, string? returnUrl)
+    {
+        if (!await _signInManager.IsTwoFactorEnabledAsync(user))
+            return null;
+        // ReturnUrl is stored raw (as core does with the login form); core's RedirectToLocal
+        // validates locality when the second factor completes.
+        new UIAccountController.LoginSession
+        {
+            ReturnUrl = returnUrl,
+            AuthenticationMethod = "NostrLogin"
+        }.Store(HttpContext.Session);
+        await _signInManager.TwoFactorSignInAsync(user);
+        return "/login/second-login";
+    }
+
     /// <summary>Runs BTCPay's CanLogin gate; returns false + a human error when the user may not sign in.</summary>
     private bool CanLoginOk(ApplicationUser user, out string? error)
     {
@@ -294,7 +336,9 @@ public class UINostrLoginController : Controller
     /// step — by design, so external NIP-98 clients (e.g. the vezir CLI) can log in. The gate is the
     /// full NIP-98 proof: a valid Schnorr signature by an allowlisted key, bound to THIS URL + POST,
     /// fresh, and single-use (replay-guarded), plus per-IP rate limiting. A stolen event is
-    /// URL-bound and replay-blocked; it cannot be replayed here.
+    /// URL-bound and replay-blocked; it cannot be replayed here. Accounts with 2FA enabled are
+    /// refused: a second factor cannot be collected on a non-interactive endpoint, and key proof
+    /// alone must not downgrade a 2FA account to 1FA.
     /// </summary>
     [AllowAnonymous]
     [IgnoreAntiforgeryToken]
@@ -325,6 +369,20 @@ public class UINostrLoginController : Controller
             _logger.LogWarning("NostrLogin NIP-98 login: verified but no linked user for pubkey {PubkeyPrefix}",
                 NostrLoginService.TruncatePubkey(signed.PublicKey));
             return Json(new { status = "failed", error = resolveError });
+        }
+
+        // 2FA: this endpoint is non-interactive by design (headless NIP-98 clients), so a second
+        // factor cannot be collected here. Key proof alone is single-factor — refuse rather than
+        // silently downgrade the account to 1FA. Programmatic access for 2FA accounts belongs to
+        // scoped Greenfield API keys, not cookie login.
+        if (await _signInManager.IsTwoFactorEnabledAsync(user))
+        {
+            _logger.LogInformation("NostrLogin NIP-98 login: rejected for user {UserId} — account requires 2FA (non-interactive endpoint)", user.Id);
+            return StatusCode(StatusCodes.Status403Forbidden, new
+            {
+                status = "failed",
+                error = "This account requires two-factor authentication. Sign in with Nostr via the QR code in a browser instead."
+            });
         }
 
         if (!CanLoginOk(user, out var loginError))
@@ -384,10 +442,18 @@ public class UINostrLoginController : Controller
             return Json(new { status = "failed", error = resolveError });
         }
 
+        _profilePictureService.SyncInBackground(user.Id, signed.PublicKey!);
+
+        // 2FA hand-off: this is a browser flow (same-device magic link), so the second factor CAN
+        // be collected — send the browser to core's second-factor page instead of signing in here.
+        if (await StartTwoFactorIfRequiredAsync(user, returnUrl) is { } secondLoginUrl)
+        {
+            _logger.LogInformation("NostrLogin NIP-98 login link: user {UserId} requires 2FA; handing off to second-factor flow", user.Id);
+            return LocalRedirect(secondLoginUrl);
+        }
+
         if (!CanLoginOk(user, out var loginError))
             return Json(new { status = "failed", error = loginError });
-
-        _profilePictureService.SyncInBackground(user.Id, signed.PublicKey!);
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         _logger.LogInformation("NostrLogin NIP-98 login link: approved for user {UserId}", user.Id);

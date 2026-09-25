@@ -59,7 +59,7 @@ public class NostrProfilePictureService
     }
 
     /// <summary>Fire-and-forget sync entry — safe to call from a request path.</summary>
-    public void SyncInBackground(string userId, string pubkey)
+    public virtual void SyncInBackground(string userId, string pubkey)
     {
         _ = Task.Run(async () =>
         {

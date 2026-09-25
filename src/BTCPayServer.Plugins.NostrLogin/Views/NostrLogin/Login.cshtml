@@ -57,7 +57,9 @@
                 try {
                     var response = await fetch(statusUrl);
                     var data = await response.json();
-                    if (data.status === "approved") {
+                    if (data.status === "approved" || data.status === "2fa_required") {
+                        // 2fa_required: the account has two-factor enabled; the server set the
+                        // 2FA cookie on this response and core's second-factor page takes over.
                         clearInterval(timer);
                         window.location.href = data.redirect;
                     } else if (data.status === "auth_required") {

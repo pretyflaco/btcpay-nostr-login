@@ -102,6 +102,13 @@ cd submodules/btcpayserver/BTCPayServer.Tests && docker compose up -d dev
 - **Signed-event validation** (`ValidateSignedEvent`) is the auth-critical gate:
   kind 22242, pubkey match, challenge tag match, timestamp freshness, valid
   Schnorr signature. It is `internal` so it can be unit tested — keep it covered.
+- **2FA is never bypassed.** A nostr key is a single possession factor (unlike a
+  passkey, which core treats as 2FA-complete). Accounts with two-factor enabled
+  get NO auth cookie from key proof alone: the interactive paths (QR status
+  poller, NIP-98 GET link) hand off to core's second-factor flow
+  (`StartTwoFactorIfRequiredAsync` → `/login/second-login`), and the
+  non-interactive `POST /login/nostr/nip98` refuses 2FA accounts outright.
+  Programmatic access for 2FA accounts = scoped Greenfield API keys.
 - **Rate limiting** on anonymous login-session creation (per IP). Ephemeral
   per-session keys are zeroized on resolution.
 - **Auto user creation** is off by default and, when enabled, still honours the
