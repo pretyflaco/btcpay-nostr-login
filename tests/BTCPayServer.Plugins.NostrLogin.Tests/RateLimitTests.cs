@@ -56,8 +56,8 @@ public class PendingSessionCapTests
 
         Assert.Equal(Nip46SessionStatus.Failed, rejected.Status);
         Assert.Contains("open sign-in sessions", rejected.Error);
-        // Registered, so the status poller surfaces the real reason rather than "expired".
-        Assert.NotNull(service.GetSession(rejected.Id));
+        // Rejected sessions are not registered (the error page renders no poller).
+        Assert.Null(service.GetSession(rejected.Id));
     }
 
     [Fact]

@@ -46,6 +46,26 @@ public class RelayPoolResilienceTests
     }
 
     [Fact]
+    public async Task SessionCancellationDuringConnectDoesNotWaitForTimeout()
+    {
+        var listener = StartStallingRelay(out var url);
+        using var pool = new RelayPool([url], new string('a', 64),
+            NullLogger.Instance, "s1", diagnostics: false);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+
+        var sw = Stopwatch.StartNew();
+        var connected = await pool.ConnectAsync(cts.Token);
+        sw.Stop();
+
+        Assert.Equal(0, connected);
+        // The session token (expiry/shutdown) must abort the connect promptly — not ride out
+        // the 5s relay timeout.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3),
+            $"cancellation should abort the connect promptly, took {sw.Elapsed.TotalSeconds:0.0}s");
+        listener.Stop();
+    }
+
+    [Fact]
     public async Task FailedRelayIsNotRetriedWithinBackoffWindow()
     {
         var listener = StartStallingRelay(out var url);

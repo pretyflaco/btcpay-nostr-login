@@ -159,12 +159,14 @@ internal sealed class RelayPool : IDisposable
             // drops packets (firewalled/banned IP) would therefore hang for the OS TCP timeout
             // (~2 min), stalling the initial connect AND every republish's reconnect attempt.
             // Race the call against a hard delay instead; Dispose cancels NNostr's internal CTS,
-            // which does abort the in-flight socket connect.
+            // which does abort the in-flight socket connect. The delay rides connectCts, so a
+            // successful connect leaves no stray timer behind.
             var connectTask = client.ConnectAndWaitUntilConnected(connectCts.Token, ct);
-            if (await Task.WhenAny(connectTask, Task.Delay(ConnectTimeout, ct)) != connectTask)
+            if (await Task.WhenAny(connectTask, Task.Delay(Timeout.InfiniteTimeSpan, connectCts.Token)) != connectTask)
             {
                 _ = connectTask.ContinueWith(t => { _ = t.Exception; }, CancellationToken.None,
                     TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+                ct.ThrowIfCancellationRequested(); // session cancelled mid-connect ≠ relay timeout
                 throw new TimeoutException("timed out");
             }
             await connectTask; // propagate any connect failure into the catch below

@@ -170,12 +170,14 @@ public class NostrLoginService : IDisposable
     }
 
     /// <summary>
-    /// Failed session returned (and registered, so the status poller surfaces the real reason
-    /// rather than "expired") when an anonymous login attempt is throttled.
+    /// Failed session returned when an anonymous login attempt is throttled. Deliberately NOT
+    /// registered in <see cref="_sessions"/>: the login page renders the error up-front
+    /// (InitialError) and its error branch starts no status poller, and session reuse ignores
+    /// Failed sessions — nothing would ever read the entry before Cleanup swept it.
     /// </summary>
     private Nip46Session RejectLoginSession(string error)
     {
-        var rejected = new Nip46Session
+        return new Nip46Session
         {
             Id = Guid.NewGuid().ToString("N"),
             Purpose = Nip46SessionPurpose.Login,
@@ -184,14 +186,16 @@ public class NostrLoginService : IDisposable
             Error = error,
             RateLimited = true
         };
-        _sessions[rejected.Id] = rejected;
-        return rejected;
     }
 
     /// <summary>Live (pending) Login sessions held by one rate-limit key right now.</summary>
     private int CountPendingLoginSessions(string rateLimitKey) =>
         _sessions.Values.Count(s => s.Purpose == Nip46SessionPurpose.Login
             && s.Status == Nip46SessionStatus.Pending && s.LimitKey == rateLimitKey);
+
+    /// <summary>Serializes the pending-cap check with session registration so concurrent GETs
+    /// from one origin cannot overshoot the cap (check-then-add race).</summary>
+    private readonly object _sessionAdmissionLock = new();
 
     /// <summary>
     /// Creates a NIP-46 session and returns immediately with a ready-to-render nostrconnect:// URI.
@@ -207,15 +211,10 @@ public class NostrLoginService : IDisposable
         Cleanup();
 
         // M3: only throttle anonymous login sessions; link sessions are already authenticated.
-        if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null)
-        {
-            if (!AllowLoginAttempt(rateLimitKey))
-                return Task.FromResult(RejectLoginSession(
-                    "Too many sign-in attempts. Please wait a moment and reload the page."));
-            if (CountPendingLoginSessions(rateLimitKey) >= MaxPendingLoginSessions)
-                return Task.FromResult(RejectLoginSession(
-                    "Too many open sign-in sessions. Complete one or wait for it to expire."));
-        }
+        if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null
+            && !AllowLoginAttempt(rateLimitKey))
+            return Task.FromResult(RejectLoginSession(
+                "Too many sign-in attempts. Please wait a moment and reload the page."));
 
         if (relays.Length == 0)
             relays = DefaultRelays;
@@ -226,18 +225,31 @@ public class NostrLoginService : IDisposable
 
         var connectUri = BuildConnectUri(clientPubkey, relays, secret, appName, appUrl, imageUrl);
 
-        var session = new Nip46Session
+        Nip46Session session;
+        // The cap check and the registration must be atomic, or a burst of simultaneous requests
+        // from one origin overshoots the cap.
+        lock (_sessionAdmissionLock)
         {
-            Id = Guid.NewGuid().ToString("N"),
-            Purpose = purpose,
-            LinkUserId = linkUserId,
-            ConnectUri = connectUri,
-            BindingNonce = bindingNonce,
-            OriginKey = originKey,
-            LimitKey = rateLimitKey
-        };
-        _sessions[session.Id] = session;
-        session.Cts.CancelAfter(SessionLifetime);
+            if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null
+                && CountPendingLoginSessions(rateLimitKey) >= MaxPendingLoginSessions)
+            {
+                ZeroizeAndDispose(clientKey);
+                return Task.FromResult(RejectLoginSession(
+                    "Too many open sign-in sessions. Complete one or wait for it to expire."));
+            }
+            session = new Nip46Session
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Purpose = purpose,
+                LinkUserId = linkUserId,
+                ConnectUri = connectUri,
+                BindingNonce = bindingNonce,
+                OriginKey = originKey,
+                LimitKey = rateLimitKey
+            };
+            _sessions[session.Id] = session;
+            session.Cts.CancelAfter(SessionLifetime);
+        }
 
         _logger.LogInformation(
             "NostrLogin session {SessionId} created (purpose={Purpose}, relays=[{Relays}], relaySource={RelaySource})",
