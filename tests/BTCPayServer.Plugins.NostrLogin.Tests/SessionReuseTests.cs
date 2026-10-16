@@ -97,7 +97,7 @@ public class SessionReuseTests
 
     // --- controller-level flow ---
 
-    private class FakeUrlHelper : IUrlHelper
+    internal class FakeUrlHelper : IUrlHelper
     {
         public ActionContext ActionContext => null!;
         public string? Action(UrlActionContext actionContext) => "/login/nostr/status/x";
@@ -118,7 +118,7 @@ public class SessionReuseTests
         return header[start..(end < 0 ? header.Length : end)];
     }
 
-    private class FakeTempDataProvider : ITempDataProvider
+    internal class FakeTempDataProvider : ITempDataProvider
     {
         public IDictionary<string, object> LoadTempData(HttpContext context) => new Dictionary<string, object>();
         public void SaveTempData(HttpContext context, IDictionary<string, object> values) { }

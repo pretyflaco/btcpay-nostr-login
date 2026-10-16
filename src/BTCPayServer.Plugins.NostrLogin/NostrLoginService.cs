@@ -77,6 +77,12 @@ public class Nip46Session
     internal string? LimitKey { get; init; }
 
     /// <summary>
+    /// True for sessions rejected up-front by a throttle (per-minute limit or pending cap), so
+    /// the controller can answer 429 + Retry-After instead of a bare 200.
+    /// </summary>
+    internal bool RateLimited { get; init; }
+
+    /// <summary>
     /// x-only pubkey (hex) of the first signer that sent a decryptable kind-24133 RPC, set the
     /// moment the hello arrives — even when auth subsequently fails (probe vs member forensics).
     /// </summary>
@@ -175,7 +181,8 @@ public class NostrLoginService : IDisposable
             Purpose = Nip46SessionPurpose.Login,
             ConnectUri = "",
             Status = Nip46SessionStatus.Failed,
-            Error = error
+            Error = error,
+            RateLimited = true
         };
         _sessions[rejected.Id] = rejected;
         return rejected;

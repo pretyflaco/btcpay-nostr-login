@@ -201,6 +201,14 @@ public class UINostrLoginController : Controller
                 MaxAge = TimeSpan.FromMinutes(10)
             });
         }
+        // Throttled (per-minute limit or pending cap): tell machines to back off while humans
+        // still get the same friendly error page. The view's InitialError branch renders no
+        // status poller, so the 429 changes nothing about the browser UX.
+        if (session is { Status: Nip46SessionStatus.Failed, RateLimited: true })
+        {
+            Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            Response.Headers.RetryAfter = "60";
+        }
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
     }
