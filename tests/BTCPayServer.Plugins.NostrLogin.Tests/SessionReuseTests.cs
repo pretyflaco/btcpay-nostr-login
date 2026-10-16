@@ -195,4 +195,70 @@ public class SessionReuseTests
         Assert.Equal(1, service.SessionCountForTest);
         Assert.StartsWith(vm.SessionId + ".", ExtractBindCookie(rig.HttpContext.Response.Headers.SetCookie));
     }
+
+    // --- the full cookie contract: what Login GET writes, LoginStatus must accept ---
+
+    [Fact]
+    public async Task ApprovedSessionCompletesWithNewFormatCookie()
+    {
+        var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
+        var (_, pubkey) = await TwoFactorGateTests.NewKey();
+        // 2FA-enabled rig: the hand-off runs AFTER the M2 nonce check, so "2fa_required"
+        // proves the nonce was accepted (and avoids the non-2FA path's UserService).
+        var rig = TwoFactorGateTests.BuildRig(pubkey, twoFactorEnabled: true, service);
+        var vm = await GetLoginPage(rig);
+
+        // The browser carries the (new-format) bind cookie back on every status poll.
+        var bind = ExtractBindCookie(rig.HttpContext.Response.Headers.SetCookie);
+        rig.HttpContext.Request.Headers.Cookie = "NostrLogin.Bind=" + bind;
+
+        // Signer completes the handshake out of band.
+        var session = service.GetSession(vm.SessionId)!;
+        session.Status = Nip46SessionStatus.Approved;
+        session.UserPubkey = pubkey;
+
+        var body = TwoFactorGateTests.JsonOf(await rig.Controller.LoginStatus(session.Id));
+
+        Assert.Equal("2fa_required", body.GetProperty("status").GetString());
+        Assert.Null(service.GetSession(session.Id)); // single use
+    }
+
+    [Fact]
+    public async Task NewFormatCookieWithWrongNonceIsRejected()
+    {
+        var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
+        var (_, pubkey) = await TwoFactorGateTests.NewKey();
+        var rig = TwoFactorGateTests.BuildRig(pubkey, twoFactorEnabled: true, service);
+        var vm = await GetLoginPage(rig);
+
+        var session = service.GetSession(vm.SessionId)!;
+        session.Status = Nip46SessionStatus.Approved;
+        session.UserPubkey = pubkey;
+
+        // Right session id, wrong nonce (QRLjacker who scraped the status URL).
+        rig.HttpContext.Request.Headers.Cookie = $"NostrLogin.Bind={session.Id}.{OtherNonce}";
+        var body = TwoFactorGateTests.JsonOf(await rig.Controller.LoginStatus(session.Id));
+
+        Assert.Equal("failed", body.GetProperty("status").GetString());
+        Assert.Contains("same browser", body.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task LegacyNonceOnlyCookieStillCompletes()
+    {
+        // Sessions minted before the "{sessionId}.{nonce}" format shipped hold a bare-nonce
+        // cookie; they must still be able to complete sign-in after the deploy.
+        var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
+        var (_, pubkey) = await TwoFactorGateTests.NewKey();
+        var session = await service.CreateSessionAsync(Nip46SessionPurpose.Login,
+            Blackhole, "test", bindingNonce: Nonce);
+        session.Status = Nip46SessionStatus.Approved;
+        session.UserPubkey = pubkey;
+        var rig = TwoFactorGateTests.BuildRig(pubkey, twoFactorEnabled: true, service,
+            bindCookieNonce: Nonce);
+
+        var body = TwoFactorGateTests.JsonOf(await rig.Controller.LoginStatus(session.Id));
+
+        Assert.Equal("2fa_required", body.GetProperty("status").GetString());
+    }
 }

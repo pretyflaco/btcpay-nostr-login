@@ -229,6 +229,20 @@ public class UINostrLoginController : Controller
         return _nostrLoginService.TryReuseSession(cookie[..dot], cookie[(dot + 1)..]);
     }
 
+    /// <summary>
+    /// The nonce portion of the bind cookie: the part after the dot in the current
+    /// "{sessionId}.{nonce}" format, or the whole value for legacy nonce-only cookies set
+    /// before that format shipped (their sessions must still be able to complete).
+    /// </summary>
+    private string? PresentedBindNonce()
+    {
+        var cookie = Request.Cookies[BindCookieName];
+        if (cookie is null)
+            return null;
+        var dot = cookie.IndexOf('.');
+        return dot >= 0 ? cookie[(dot + 1)..] : cookie;
+    }
+
     [AllowAnonymous]
     [HttpGet("/login/nostr/status/{sessionId}")]
     public async Task<IActionResult> LoginStatus(string sessionId, string? returnUrl = null)
@@ -250,7 +264,7 @@ public class UINostrLoginController : Controller
         }
 
         // Approved. M2: enforce browser-origin binding before issuing any cookie.
-        var presentedNonce = Request.Cookies[BindCookieName];
+        var presentedNonce = PresentedBindNonce();
         if (session.BindingNonce is not null &&
             !NostrLoginService.BindingNonceMatches(session.BindingNonce, presentedNonce))
         {
