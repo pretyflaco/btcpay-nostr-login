@@ -192,14 +192,17 @@ public class UINostrLoginController : Controller
                 appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
                 diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl(),
                 relaysFromSettings: relaysFromSettings, originKey: OriginKey());
-            Response.Cookies.Append(BindCookieName, session.Id + "." + bindingNonce, new CookieOptions
-            {
-                HttpOnly = true,
-                Secure = Request.IsHttps,
-                SameSite = SameSiteMode.Strict,
-                IsEssential = true,
-                MaxAge = TimeSpan.FromMinutes(10)
-            });
+            // Throttled sessions are Failed up-front and never registered, so a bind cookie
+            // would reference nothing: skip writing it (the next reload simply starts fresh).
+            if (session.Status != Nip46SessionStatus.Failed)
+                Response.Cookies.Append(BindCookieName, session.Id + "." + bindingNonce, new CookieOptions
+                {
+                    HttpOnly = true,
+                    Secure = Request.IsHttps,
+                    SameSite = SameSiteMode.Strict,
+                    IsEssential = true,
+                    MaxAge = TimeSpan.FromMinutes(10)
+                });
         }
         // Throttled (per-minute limit or pending cap): tell machines to back off while humans
         // still get the same friendly error page. The view's InitialError branch renders no

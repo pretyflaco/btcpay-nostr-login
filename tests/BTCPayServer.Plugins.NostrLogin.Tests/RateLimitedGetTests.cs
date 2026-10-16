@@ -33,6 +33,8 @@ public class RateLimitedGetTests
         // The human-facing page is unchanged: friendly error, no QR, no poller.
         Assert.Contains("Too many", vm.InitialError);
         Assert.Empty(vm.QrDataUri);
+        // No bind cookie is written for a throttled (never-registered) session.
+        Assert.DoesNotContain("NostrLogin.Bind", rig.HttpContext.Response.Headers.SetCookie.ToString());
     }
 
     [Fact]

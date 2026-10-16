@@ -66,6 +66,9 @@ internal sealed class RelayPool : IDisposable
 
     public ChannelReader<NostrEvent> Events => _events.Reader;
 
+    // Exposed for unit tests (asserting failure classification, e.g. timeout vs cancellation).
+    internal IReadOnlyDictionary<string, (string Reason, DateTimeOffset At)> ConnectFailuresForTest => _connectFailures;
+
     public int LiveCount => _clients.Count;
 
     /// <summary>

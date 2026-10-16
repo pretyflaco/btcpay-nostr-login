@@ -18,11 +18,11 @@ public class RelayPoolResilienceTests
     {
         var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
+        var held = new List<Socket>(); // keep accepted connections open (never answered)
         _ = Task.Run(async () =>
         {
-            // Accept and hold connections open without ever responding.
             while (true)
-                _ = await listener.AcceptSocketAsync();
+                held.Add(await listener.AcceptSocketAsync());
         });
         url = $"ws://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}";
         return listener;
@@ -42,6 +42,8 @@ public class RelayPoolResilienceTests
         Assert.Equal(0, connected);
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(15),
             $"connect should be bounded by the per-relay timeout (~5s), took {sw.Elapsed.TotalSeconds:0.0}s");
+        // A genuinely unreachable relay is classified as a timeout...
+        Assert.Equal("timed out", pool.ConnectFailuresForTest[url].Reason);
         listener.Stop();
     }
 
@@ -59,9 +61,12 @@ public class RelayPoolResilienceTests
 
         Assert.Equal(0, connected);
         // The session token (expiry/shutdown) must abort the connect promptly — not ride out
-        // the 5s relay timeout.
+        // the 5s relay timeout...
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3),
             $"cancellation should abort the connect promptly, took {sw.Elapsed.TotalSeconds:0.0}s");
+        // ...and must be classified as cancellation, not misreported as a relay timeout.
+        Assert.DoesNotContain("timed out", pool.ConnectFailuresForTest[url].Reason);
+        Assert.Contains("cancel", pool.ConnectFailuresForTest[url].Reason, StringComparison.OrdinalIgnoreCase);
         listener.Stop();
     }
 
