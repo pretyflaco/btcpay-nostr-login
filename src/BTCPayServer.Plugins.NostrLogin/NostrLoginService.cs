@@ -71,6 +71,12 @@ public class Nip46Session
     internal string? OriginKey { get; init; }
 
     /// <summary>
+    /// Rate-limit key (typically client IP) this Login session counts against for the pending
+    /// cap. Null for Link sessions and non-HTTP callers.
+    /// </summary>
+    internal string? LimitKey { get; init; }
+
+    /// <summary>
     /// x-only pubkey (hex) of the first signer that sent a decryptable kind-24133 RPC, set the
     /// moment the hello arrives — even when auth subsequently fails (probe vs member forensics).
     /// </summary>
@@ -113,6 +119,14 @@ public class NostrLoginService : IDisposable
     private static readonly TimeSpan RateLimitWindow = TimeSpan.FromMinutes(1);
     private const int MaxLoginSessionsPerWindow = 10;
 
+    // Bound on SIMULTANEOUSLY pending Login sessions per rate-limit key: each pending session
+    // holds relay websockets for its whole 5-minute lifetime, so the per-minute window alone
+    // still lets one origin accumulate ~50 live sessions (10/min x 5 min). The cap is the real
+    // bound on relay connections per origin. Note Tor traffic shares the proxy-IP bucket (as
+    // with the per-minute limit), so legit onion users rely on QR session reuse keeping them at
+    // one pending session.
+    private const int MaxPendingLoginSessions = 3;
+
     // Probe signal: login sessions that expire without any signer hello, counted per origin
     // class ("onion" / "clearnet:{ip}"). A single warn fires when the hourly count crosses the
     // threshold — Tor probers enumerate /login/nostr (creating sessions) without ever scanning
@@ -150,6 +164,29 @@ public class NostrLoginService : IDisposable
     }
 
     /// <summary>
+    /// Failed session returned (and registered, so the status poller surfaces the real reason
+    /// rather than "expired") when an anonymous login attempt is throttled.
+    /// </summary>
+    private Nip46Session RejectLoginSession(string error)
+    {
+        var rejected = new Nip46Session
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Purpose = Nip46SessionPurpose.Login,
+            ConnectUri = "",
+            Status = Nip46SessionStatus.Failed,
+            Error = error
+        };
+        _sessions[rejected.Id] = rejected;
+        return rejected;
+    }
+
+    /// <summary>Live (pending) Login sessions held by one rate-limit key right now.</summary>
+    private int CountPendingLoginSessions(string rateLimitKey) =>
+        _sessions.Values.Count(s => s.Purpose == Nip46SessionPurpose.Login
+            && s.Status == Nip46SessionStatus.Pending && s.LimitKey == rateLimitKey);
+
+    /// <summary>
     /// Creates a NIP-46 session and returns immediately with a ready-to-render nostrconnect:// URI.
     /// Relay connection, subscription and the RPC flow all run on a background task so the HTTP
     /// request rendering the QR never blocks on relay connectivity (a slow/dead relay used to hang
@@ -163,19 +200,14 @@ public class NostrLoginService : IDisposable
         Cleanup();
 
         // M3: only throttle anonymous login sessions; link sessions are already authenticated.
-        if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null && !AllowLoginAttempt(rateLimitKey))
+        if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null)
         {
-            var rejected = new Nip46Session
-            {
-                Id = Guid.NewGuid().ToString("N"),
-                Purpose = purpose,
-                ConnectUri = "",
-                Status = Nip46SessionStatus.Failed,
-                Error = "Too many sign-in attempts. Please wait a moment and reload the page."
-            };
-            // Register it so the status poller surfaces the real reason rather than "expired".
-            _sessions[rejected.Id] = rejected;
-            return Task.FromResult(rejected);
+            if (!AllowLoginAttempt(rateLimitKey))
+                return Task.FromResult(RejectLoginSession(
+                    "Too many sign-in attempts. Please wait a moment and reload the page."));
+            if (CountPendingLoginSessions(rateLimitKey) >= MaxPendingLoginSessions)
+                return Task.FromResult(RejectLoginSession(
+                    "Too many open sign-in sessions. Complete one or wait for it to expire."));
         }
 
         if (relays.Length == 0)
@@ -194,7 +226,8 @@ public class NostrLoginService : IDisposable
             LinkUserId = linkUserId,
             ConnectUri = connectUri,
             BindingNonce = bindingNonce,
-            OriginKey = originKey
+            OriginKey = originKey,
+            LimitKey = rateLimitKey
         };
         _sessions[session.Id] = session;
         session.Cts.CancelAfter(SessionLifetime);
@@ -349,6 +382,7 @@ public class NostrLoginService : IDisposable
     // Exposed for unit tests.
     internal bool AllowLoginAttemptForTest(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
     internal static int MaxLoginSessionsPerWindowForTest => MaxLoginSessionsPerWindow;
+    internal static int MaxPendingLoginSessionsForTest => MaxPendingLoginSessions;
     internal void RecordProbelessExpiryForTest(string originKey) => RecordProbelessExpiry(originKey);
     internal static int ProbeAlertThresholdForTest => ProbeAlertThreshold;
 
