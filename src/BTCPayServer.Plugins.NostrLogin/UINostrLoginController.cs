@@ -232,9 +232,10 @@ public class UINostrLoginController : Controller
         if (user is null)
         {
             // The auth event verified but the key maps to no account: a stranger/prober, not a
-            // member. Distinct warn so forensics can tell the two apart at a glance.
-            _logger.LogWarning("NostrLogin session {SessionId}: verified but no linked user for pubkey {PubkeyPrefix}",
-                session.Id, NostrLoginService.TruncatePubkey(session.UserPubkey));
+            // member. Distinct warn so forensics can tell the two apart at a glance. Full pubkey
+            // + npub (pubkeys are public; truncating only helps an attacker stay anonymous).
+            _logger.LogWarning("NostrLogin session {SessionId}: verified but no linked user for pubkey {Pubkey} (npub {Npub})",
+                session.Id, session.UserPubkey, session.UserPubkey?.ToNpub());
             return Json(new { status = "failed", error = resolveError });
         }
 
@@ -366,8 +367,8 @@ public class UINostrLoginController : Controller
         var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
         if (user is null)
         {
-            _logger.LogWarning("NostrLogin NIP-98 login: verified but no linked user for pubkey {PubkeyPrefix}",
-                NostrLoginService.TruncatePubkey(signed.PublicKey));
+            _logger.LogWarning("NostrLogin NIP-98 login: verified but no linked user for pubkey {Pubkey} (npub {Npub})",
+                signed.PublicKey, signed.PublicKey?.ToNpub());
             return Json(new { status = "failed", error = resolveError });
         }
 
@@ -437,8 +438,8 @@ public class UINostrLoginController : Controller
         var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
         if (user is null)
         {
-            _logger.LogWarning("NostrLogin NIP-98 login link: verified but no linked user for pubkey {PubkeyPrefix}",
-                NostrLoginService.TruncatePubkey(signed.PublicKey));
+            _logger.LogWarning("NostrLogin NIP-98 login link: verified but no linked user for pubkey {Pubkey} (npub {Npub})",
+                signed.PublicKey, signed.PublicKey?.ToNpub());
             return Json(new { status = "failed", error = resolveError });
         }
 
