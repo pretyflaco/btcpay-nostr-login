@@ -171,28 +171,54 @@ public class UINostrLoginController : Controller
         if (User.Identity?.IsAuthenticated is true)
             return Redirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
 
-        // M2: mint a per-session nonce, bind it to this browser via a strict cookie, and store
-        // it on the session. The sign-in cookie is only issued to a caller presenting this nonce.
-        var bindingNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-        Response.Cookies.Append(BindCookieName, bindingNonce, new CookieOptions
+        // M2/session reuse: the bind cookie value is "{sessionId}.{nonce}". A browser returning
+        // with a valid cookie for a still-pending session gets the same QR re-rendered instead of
+        // minting a fresh session — kills the paired-session noise from crawlers/double page loads
+        // and avoids the duplicate relay connections. The nonce gate itself is unchanged
+        // (constant-time, M2); the session id is not a secret (it appears in the page's status
+        // URL). A browser without the cookie — e.g. a QRLjacker — cannot reuse anything and gets
+        // a fresh session with a fresh nonce, exactly as before.
+        var session = TryReuseBoundSession();
+        if (session is null)
         {
-            HttpOnly = true,
-            Secure = Request.IsHttps,
-            SameSite = SameSiteMode.Strict,
-            IsEssential = true,
-            MaxAge = TimeSpan.FromMinutes(10)
-        });
-
-        var (relays, relaysFromSettings) = await GetRelays();
-        var session = await _nostrLoginService.CreateSessionAsync(
-            Nip46SessionPurpose.Login, relays, InstanceAppName(),
-            bindingNonce: bindingNonce,
-            rateLimitKey: RateLimitKey(),
-            appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
-            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl(),
-            relaysFromSettings: relaysFromSettings, originKey: OriginKey());
+            // M2: mint a per-session nonce, bind it to this browser via a strict cookie, and store
+            // it on the session. The sign-in cookie is only issued to a caller presenting this nonce.
+            var bindingNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+            var (relays, relaysFromSettings) = await GetRelays();
+            session = await _nostrLoginService.CreateSessionAsync(
+                Nip46SessionPurpose.Login, relays, InstanceAppName(),
+                bindingNonce: bindingNonce,
+                rateLimitKey: RateLimitKey(),
+                appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
+                diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl(),
+                relaysFromSettings: relaysFromSettings, originKey: OriginKey());
+            Response.Cookies.Append(BindCookieName, session.Id + "." + bindingNonce, new CookieOptions
+            {
+                HttpOnly = true,
+                Secure = Request.IsHttps,
+                SameSite = SameSiteMode.Strict,
+                IsEssential = true,
+                MaxAge = TimeSpan.FromMinutes(10)
+            });
+        }
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
+    }
+
+    /// <summary>
+    /// Returns the browser's still-pending Login session when the bind cookie names one and
+    /// presents its nonce; null (mint fresh) otherwise — including for legacy nonce-only
+    /// cookies set before the "{sessionId}.{nonce}" format shipped.
+    /// </summary>
+    private Nip46Session? TryReuseBoundSession()
+    {
+        var cookie = Request.Cookies[BindCookieName];
+        if (cookie is null)
+            return null;
+        var dot = cookie.IndexOf('.');
+        if (dot <= 0 || dot == cookie.Length - 1)
+            return null;
+        return _nostrLoginService.TryReuseSession(cookie[..dot], cookie[(dot + 1)..]);
     }
 
     [AllowAnonymous]

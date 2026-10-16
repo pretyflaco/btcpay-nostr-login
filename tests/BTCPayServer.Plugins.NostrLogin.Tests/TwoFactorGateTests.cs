@@ -202,6 +202,12 @@ public class TwoFactorGateTests
         {
             PubkeyToUserId = new Dictionary<string, string> { [pubkey] = user.Id }
         };
+        // Blackhole relay so controller actions that create sessions (Login GET) never open
+        // real websockets in tests.
+        repo.Store[typeof(NostrLoginSettings).Name] = new NostrLoginSettings
+        {
+            Relays = new List<string> { "wss://10.255.255.1:9" }
+        };
 
         var auth = new FakeAuthenticationService();
         var http = new DefaultHttpContext

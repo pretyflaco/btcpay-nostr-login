@@ -36,7 +36,7 @@ public class Nip46Session
     public string? LinkUserId { get; init; }
 
     public required string ConnectUri { get; init; }
-    public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset CreatedAt { get; internal set; } = DateTimeOffset.UtcNow;
 
     public Nip46SessionStatus Status { get; internal set; } = Nip46SessionStatus.Pending;
 
@@ -335,6 +335,30 @@ public class NostrLoginService : IDisposable
 
     public Nip46Session? GetSession(string id) => _sessions.GetValueOrDefault(id);
 
+    /// <summary>A pending session is only re-rendered while it still has this much lifetime left.</summary>
+    internal static readonly TimeSpan ReuseMinRemaining = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Returns an existing pending Login session for QR re-rendering when the caller proves
+    /// ownership of the session's bind nonce (M2: the same constant-time check LoginStatus
+    /// applies before issuing the sign-in cookie). Reuse changes none of the auth semantics:
+    /// same session, same nonce, same single-use completion — it only avoids minting a duplicate
+    /// session (and its relay connections) when a browser reloads /login/nostr. Returns null —
+    /// mint fresh — for unknown, non-Login, resolved, nearly-expired or foreign-nonce sessions.
+    /// </summary>
+    internal Nip46Session? TryReuseSession(string sessionId, string? presentedNonce)
+    {
+        if (!_sessions.TryGetValue(sessionId, out var session))
+            return null;
+        if (session.Purpose != Nip46SessionPurpose.Login || session.Status != Nip46SessionStatus.Pending)
+            return null;
+        if (!BindingNonceMatches(session.BindingNonce, presentedNonce))
+            return null;
+        if (DateTimeOffset.UtcNow - session.CreatedAt > SessionLifetime - ReuseMinRemaining)
+            return null;
+        return session;
+    }
+
     public void RemoveSession(string id)
     {
         if (_sessions.TryRemove(id, out var session))
@@ -383,6 +407,7 @@ public class NostrLoginService : IDisposable
     internal bool AllowLoginAttemptForTest(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
     internal static int MaxLoginSessionsPerWindowForTest => MaxLoginSessionsPerWindow;
     internal static int MaxPendingLoginSessionsForTest => MaxPendingLoginSessions;
+    internal int SessionCountForTest => _sessions.Count;
     internal void RecordProbelessExpiryForTest(string originKey) => RecordProbelessExpiry(originKey);
     internal static int ProbeAlertThresholdForTest => ProbeAlertThreshold;
 
