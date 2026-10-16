@@ -114,7 +114,7 @@ public class NonBlockingSessionTests
 public class RateLimitedSessionTests
 {
     [Fact]
-    public async Task RejectedSessionIsRegisteredAndSurfacesReason()
+    public async Task RejectedSessionSurfacesReasonWithoutBeingRegistered()
     {
         var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
         var max = NostrLoginService.MaxLoginSessionsPerWindowForTest;
@@ -130,9 +130,8 @@ public class RateLimitedSessionTests
 
         Assert.Equal(Nip46SessionStatus.Failed, rejected.Status);
         Assert.Contains("Too many", rejected.Error);
-        // Registered, so the status poller returns the real reason rather than "expired".
-        var fetched = service.GetSession(rejected.Id);
-        Assert.NotNull(fetched);
-        Assert.Equal(rejected.Id, fetched!.Id);
+        // Not registered: the error page renders InitialError with no status poller, so nothing
+        // would ever read the entry — keeping it would be pure dead weight at scan volumes.
+        Assert.Null(service.GetSession(rejected.Id));
     }
 }

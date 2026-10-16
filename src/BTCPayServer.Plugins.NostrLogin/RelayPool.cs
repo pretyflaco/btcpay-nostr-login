@@ -29,6 +29,13 @@ internal sealed class RelayPool : IDisposable
 {
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// How long a relay that failed to connect is skipped by <see cref="ReconnectDeadAsync"/>.
+    /// Without backoff, a silently-dropping relay costs a full ConnectTimeout stall on every
+    /// republish tick (every few seconds), starving the read loop. Instance-settable for tests.
+    /// </summary>
+    internal TimeSpan ReconnectBackoff { get; set; } = TimeSpan.FromSeconds(30);
+
     private readonly string[] _relays;
     private readonly string _clientPubkey;
     private readonly string _subscriptionId;
@@ -39,8 +46,8 @@ internal sealed class RelayPool : IDisposable
 
     // relayUrl -> live client. A relay absent from the map is currently disconnected.
     private readonly ConcurrentDictionary<string, NostrClient> _clients = new();
-    // relayUrl -> short failure reason from the initial connect (cleared on (re)connect).
-    private readonly ConcurrentDictionary<string, string> _connectFailures = new();
+    // relayUrl -> short failure reason + when the last connect attempt failed (backs off retries).
+    private readonly ConcurrentDictionary<string, (string Reason, DateTimeOffset At)> _connectFailures = new();
     private readonly Channel<NostrEvent> _events = Channel.CreateUnbounded<NostrEvent>();
 
     public RelayPool(string[] relays, string clientPubkey, ILogger logger, string sessionId, bool diagnostics)
@@ -58,6 +65,9 @@ internal sealed class RelayPool : IDisposable
     }
 
     public ChannelReader<NostrEvent> Events => _events.Reader;
+
+    // Exposed for unit tests (asserting failure classification, e.g. timeout vs cancellation).
+    internal IReadOnlyDictionary<string, (string Reason, DateTimeOffset At)> ConnectFailuresForTest => _connectFailures;
 
     public int LiveCount => _clients.Count;
 
@@ -87,7 +97,7 @@ internal sealed class RelayPool : IDisposable
         string.Join(", ", _relays.Select(relay =>
         {
             var host = Uri.TryCreate(relay, UriKind.Absolute, out var uri) ? uri.Host : relay;
-            return _connectFailures.TryGetValue(relay, out var reason) ? $"{host}({reason})" : $"{host}(ok)";
+            return _connectFailures.TryGetValue(relay, out var failure) ? $"{host}({failure.Reason})" : $"{host}(ok)";
         }));
 
     /// <summary>Short failure tag for the aggregate: the HTTP status when the relay refused the
@@ -123,12 +133,15 @@ internal sealed class RelayPool : IDisposable
 
     /// <summary>
     /// Reopen (and re-subscribe) any advertised relay that is not currently connected. Best-effort;
-    /// a still-dead relay is skipped. Keeps the signer's relay set and ours overlapping over the
-    /// session lifetime.
+    /// a still-dead relay is skipped, and a relay that failed within <see cref="ReconnectBackoff"/>
+    /// is not retried yet (a silently-dropping relay would otherwise stall every republish tick).
+    /// Keeps the signer's relay set and ours overlapping over the session lifetime.
     /// </summary>
     public async Task ReconnectDeadAsync(CancellationToken ct)
     {
-        var missing = _relays.Where(r => !_clients.ContainsKey(r)).ToList();
+        var now = DateTimeOffset.UtcNow;
+        var missing = _relays.Where(r => !_clients.ContainsKey(r)
+            && (!_connectFailures.TryGetValue(r, out var failure) || now - failure.At >= ReconnectBackoff)).ToList();
         if (missing.Count == 0)
             return;
         await Task.WhenAll(missing.Select(relay => OpenAndSubscribe(relay, ct, reconnect: true)));
@@ -143,7 +156,23 @@ internal sealed class RelayPool : IDisposable
         {
             using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             connectCts.CancelAfter(ConnectTimeout);
-            await client.ConnectAndWaitUntilConnected(connectCts.Token, ct);
+            // NNostr's ConnectAndWaitUntilConnected does NOT observe connectionCancellationToken
+            // during the socket connect itself (only its post-connect wait loop uses it; the
+            // ClientWebSocket.ConnectAsync is bound to the lifetime token). A relay that silently
+            // drops packets (firewalled/banned IP) would therefore hang for the OS TCP timeout
+            // (~2 min), stalling the initial connect AND every republish's reconnect attempt.
+            // Race the call against a hard delay instead; Dispose cancels NNostr's internal CTS,
+            // which does abort the in-flight socket connect. The delay rides connectCts, so a
+            // successful connect leaves no stray timer behind.
+            var connectTask = client.ConnectAndWaitUntilConnected(connectCts.Token, ct);
+            if (await Task.WhenAny(connectTask, Task.Delay(Timeout.InfiniteTimeSpan, connectCts.Token)) != connectTask)
+            {
+                _ = connectTask.ContinueWith(t => { _ = t.Exception; }, CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+                ct.ThrowIfCancellationRequested(); // session cancelled mid-connect ≠ relay timeout
+                throw new TimeoutException("timed out");
+            }
+            await connectTask; // propagate any connect failure into the catch below
             client.EventsReceived += OnEventsReceived;
             await client.CreateSubscription(_subscriptionId, _filters, ct);
             if (!_clients.TryAdd(relay, client))
@@ -162,7 +191,7 @@ internal sealed class RelayPool : IDisposable
         {
             // Per-relay failures are debug-level (aggregated once by ConnectAsync); only a 0/4
             // connect is warn-worthy.
-            _connectFailures[relay] = ShortReason(ex);
+            _connectFailures[relay] = (ShortReason(ex), DateTimeOffset.UtcNow);
             if (reconnect)
                 _logger.LogDebug("NostrLogin session {SessionId}: relay {Relay} still unavailable: {Error}",
                     _sessionId, relay, ex.Message);

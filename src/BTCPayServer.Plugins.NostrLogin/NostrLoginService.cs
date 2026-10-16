@@ -36,7 +36,7 @@ public class Nip46Session
     public string? LinkUserId { get; init; }
 
     public required string ConnectUri { get; init; }
-    public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset CreatedAt { get; internal set; } = DateTimeOffset.UtcNow;
 
     public Nip46SessionStatus Status { get; internal set; } = Nip46SessionStatus.Pending;
 
@@ -69,6 +69,18 @@ public class Nip46Session
     /// controller from the request. Null in tests / non-HTTP callers.
     /// </summary>
     internal string? OriginKey { get; init; }
+
+    /// <summary>
+    /// Rate-limit key (typically client IP) this Login session counts against for the pending
+    /// cap. Null for Link sessions and non-HTTP callers.
+    /// </summary>
+    internal string? LimitKey { get; init; }
+
+    /// <summary>
+    /// True for sessions rejected up-front by a throttle (per-minute limit or pending cap), so
+    /// the controller can answer 429 + Retry-After instead of a bare 200.
+    /// </summary>
+    internal bool RateLimited { get; init; }
 
     /// <summary>
     /// x-only pubkey (hex) of the first signer that sent a decryptable kind-24133 RPC, set the
@@ -113,6 +125,14 @@ public class NostrLoginService : IDisposable
     private static readonly TimeSpan RateLimitWindow = TimeSpan.FromMinutes(1);
     private const int MaxLoginSessionsPerWindow = 10;
 
+    // Bound on SIMULTANEOUSLY pending Login sessions per rate-limit key: each pending session
+    // holds relay websockets for its whole 5-minute lifetime, so the per-minute window alone
+    // still lets one origin accumulate ~50 live sessions (10/min x 5 min). The cap is the real
+    // bound on relay connections per origin. Note Tor traffic shares the proxy-IP bucket (as
+    // with the per-minute limit), so legit onion users rely on QR session reuse keeping them at
+    // one pending session.
+    private const int MaxPendingLoginSessions = 3;
+
     // Probe signal: login sessions that expire without any signer hello, counted per origin
     // class ("onion" / "clearnet:{ip}"). A single warn fires when the hourly count crosses the
     // threshold — Tor probers enumerate /login/nostr (creating sessions) without ever scanning
@@ -150,6 +170,34 @@ public class NostrLoginService : IDisposable
     }
 
     /// <summary>
+    /// Failed session returned when an anonymous login attempt is throttled. Deliberately NOT
+    /// registered in <see cref="_sessions"/>: the login page renders the error up-front
+    /// (InitialError) and its error branch starts no status poller, and session reuse ignores
+    /// Failed sessions — nothing would ever read the entry before Cleanup swept it.
+    /// </summary>
+    private Nip46Session RejectLoginSession(string error)
+    {
+        return new Nip46Session
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Purpose = Nip46SessionPurpose.Login,
+            ConnectUri = "",
+            Status = Nip46SessionStatus.Failed,
+            Error = error,
+            RateLimited = true
+        };
+    }
+
+    /// <summary>Live (pending) Login sessions held by one rate-limit key right now.</summary>
+    private int CountPendingLoginSessions(string rateLimitKey) =>
+        _sessions.Values.Count(s => s.Purpose == Nip46SessionPurpose.Login
+            && s.Status == Nip46SessionStatus.Pending && s.LimitKey == rateLimitKey);
+
+    /// <summary>Serializes the pending-cap check with session registration so concurrent GETs
+    /// from one origin cannot overshoot the cap (check-then-add race).</summary>
+    private readonly object _sessionAdmissionLock = new();
+
+    /// <summary>
     /// Creates a NIP-46 session and returns immediately with a ready-to-render nostrconnect:// URI.
     /// Relay connection, subscription and the RPC flow all run on a background task so the HTTP
     /// request rendering the QR never blocks on relay connectivity (a slow/dead relay used to hang
@@ -163,20 +211,10 @@ public class NostrLoginService : IDisposable
         Cleanup();
 
         // M3: only throttle anonymous login sessions; link sessions are already authenticated.
-        if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null && !AllowLoginAttempt(rateLimitKey))
-        {
-            var rejected = new Nip46Session
-            {
-                Id = Guid.NewGuid().ToString("N"),
-                Purpose = purpose,
-                ConnectUri = "",
-                Status = Nip46SessionStatus.Failed,
-                Error = "Too many sign-in attempts. Please wait a moment and reload the page."
-            };
-            // Register it so the status poller surfaces the real reason rather than "expired".
-            _sessions[rejected.Id] = rejected;
-            return Task.FromResult(rejected);
-        }
+        if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null
+            && !AllowLoginAttempt(rateLimitKey))
+            return Task.FromResult(RejectLoginSession(
+                "Too many sign-in attempts. Please wait a moment and reload the page."));
 
         if (relays.Length == 0)
             relays = DefaultRelays;
@@ -187,17 +225,31 @@ public class NostrLoginService : IDisposable
 
         var connectUri = BuildConnectUri(clientPubkey, relays, secret, appName, appUrl, imageUrl);
 
-        var session = new Nip46Session
+        Nip46Session session;
+        // The cap check and the registration must be atomic, or a burst of simultaneous requests
+        // from one origin overshoots the cap.
+        lock (_sessionAdmissionLock)
         {
-            Id = Guid.NewGuid().ToString("N"),
-            Purpose = purpose,
-            LinkUserId = linkUserId,
-            ConnectUri = connectUri,
-            BindingNonce = bindingNonce,
-            OriginKey = originKey
-        };
-        _sessions[session.Id] = session;
-        session.Cts.CancelAfter(SessionLifetime);
+            if (purpose == Nip46SessionPurpose.Login && rateLimitKey is not null
+                && CountPendingLoginSessions(rateLimitKey) >= MaxPendingLoginSessions)
+            {
+                ZeroizeAndDispose(clientKey);
+                return Task.FromResult(RejectLoginSession(
+                    "Too many open sign-in sessions. Complete one or wait for it to expire."));
+            }
+            session = new Nip46Session
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Purpose = purpose,
+                LinkUserId = linkUserId,
+                ConnectUri = connectUri,
+                BindingNonce = bindingNonce,
+                OriginKey = originKey,
+                LimitKey = rateLimitKey
+            };
+            _sessions[session.Id] = session;
+            session.Cts.CancelAfter(SessionLifetime);
+        }
 
         _logger.LogInformation(
             "NostrLogin session {SessionId} created (purpose={Purpose}, relays=[{Relays}], relaySource={RelaySource})",
@@ -302,6 +354,30 @@ public class NostrLoginService : IDisposable
 
     public Nip46Session? GetSession(string id) => _sessions.GetValueOrDefault(id);
 
+    /// <summary>A pending session is only re-rendered while it still has this much lifetime left.</summary>
+    internal static readonly TimeSpan ReuseMinRemaining = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Returns an existing pending Login session for QR re-rendering when the caller proves
+    /// ownership of the session's bind nonce (M2: the same constant-time check LoginStatus
+    /// applies before issuing the sign-in cookie). Reuse changes none of the auth semantics:
+    /// same session, same nonce, same single-use completion — it only avoids minting a duplicate
+    /// session (and its relay connections) when a browser reloads /login/nostr. Returns null —
+    /// mint fresh — for unknown, non-Login, resolved, nearly-expired or foreign-nonce sessions.
+    /// </summary>
+    internal Nip46Session? TryReuseSession(string sessionId, string? presentedNonce)
+    {
+        if (!_sessions.TryGetValue(sessionId, out var session))
+            return null;
+        if (session.Purpose != Nip46SessionPurpose.Login || session.Status != Nip46SessionStatus.Pending)
+            return null;
+        if (!BindingNonceMatches(session.BindingNonce, presentedNonce))
+            return null;
+        if (DateTimeOffset.UtcNow - session.CreatedAt > SessionLifetime - ReuseMinRemaining)
+            return null;
+        return session;
+    }
+
     public void RemoveSession(string id)
     {
         if (_sessions.TryRemove(id, out var session))
@@ -349,6 +425,8 @@ public class NostrLoginService : IDisposable
     // Exposed for unit tests.
     internal bool AllowLoginAttemptForTest(string rateLimitKey) => AllowLoginAttempt(rateLimitKey);
     internal static int MaxLoginSessionsPerWindowForTest => MaxLoginSessionsPerWindow;
+    internal static int MaxPendingLoginSessionsForTest => MaxPendingLoginSessions;
+    internal int SessionCountForTest => _sessions.Count;
     internal void RecordProbelessExpiryForTest(string originKey) => RecordProbelessExpiry(originKey);
     internal static int ProbeAlertThresholdForTest => ProbeAlertThreshold;
 

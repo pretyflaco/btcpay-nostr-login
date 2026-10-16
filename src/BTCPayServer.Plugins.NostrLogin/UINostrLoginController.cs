@@ -171,28 +171,79 @@ public class UINostrLoginController : Controller
         if (User.Identity?.IsAuthenticated is true)
             return Redirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
 
-        // M2: mint a per-session nonce, bind it to this browser via a strict cookie, and store
-        // it on the session. The sign-in cookie is only issued to a caller presenting this nonce.
-        var bindingNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-        Response.Cookies.Append(BindCookieName, bindingNonce, new CookieOptions
+        // M2/session reuse: the bind cookie value is "{sessionId}.{nonce}". A browser returning
+        // with a valid cookie for a still-pending session gets the same QR re-rendered instead of
+        // minting a fresh session — kills the paired-session noise from crawlers/double page loads
+        // and avoids the duplicate relay connections. The nonce gate itself is unchanged
+        // (constant-time, M2); the session id is not a secret (it appears in the page's status
+        // URL). A browser without the cookie — e.g. a QRLjacker — cannot reuse anything and gets
+        // a fresh session with a fresh nonce, exactly as before.
+        var session = TryReuseBoundSession();
+        if (session is null)
         {
-            HttpOnly = true,
-            Secure = Request.IsHttps,
-            SameSite = SameSiteMode.Strict,
-            IsEssential = true,
-            MaxAge = TimeSpan.FromMinutes(10)
-        });
-
-        var (relays, relaysFromSettings) = await GetRelays();
-        var session = await _nostrLoginService.CreateSessionAsync(
-            Nip46SessionPurpose.Login, relays, InstanceAppName(),
-            bindingNonce: bindingNonce,
-            rateLimitKey: RateLimitKey(),
-            appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
-            diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl(),
-            relaysFromSettings: relaysFromSettings, originKey: OriginKey());
+            // M2: mint a per-session nonce, bind it to this browser via a strict cookie, and store
+            // it on the session. The sign-in cookie is only issued to a caller presenting this nonce.
+            var bindingNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+            var (relays, relaysFromSettings) = await GetRelays();
+            session = await _nostrLoginService.CreateSessionAsync(
+                Nip46SessionPurpose.Login, relays, InstanceAppName(),
+                bindingNonce: bindingNonce,
+                rateLimitKey: RateLimitKey(),
+                appUrl: InstanceUrl(), imageUrl: NostrLoginService.DefaultImageUrl,
+                diagnostics: await GetDiagnosticsEnabled(), loginUrl: Nip98LoginUrl(),
+                relaysFromSettings: relaysFromSettings, originKey: OriginKey());
+            // Throttled sessions are Failed up-front and never registered, so a bind cookie
+            // would reference nothing: skip writing it (the next reload simply starts fresh).
+            if (session.Status != Nip46SessionStatus.Failed)
+                Response.Cookies.Append(BindCookieName, session.Id + "." + bindingNonce, new CookieOptions
+                {
+                    HttpOnly = true,
+                    Secure = Request.IsHttps,
+                    SameSite = SameSiteMode.Strict,
+                    IsEssential = true,
+                    MaxAge = TimeSpan.FromMinutes(10)
+                });
+        }
+        // Throttled (per-minute limit or pending cap): tell machines to back off while humans
+        // still get the same friendly error page. The view's InitialError branch renders no
+        // status poller, so the 429 changes nothing about the browser UX.
+        if (session is { Status: Nip46SessionStatus.Failed, RateLimited: true })
+        {
+            Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            Response.Headers.RetryAfter = "60";
+        }
         var statusUrl = Url.Action(nameof(LoginStatus), new { sessionId = session.Id, returnUrl })!;
         return View("/Views/NostrLogin/Login.cshtml", ToViewModel(session, statusUrl, returnUrl));
+    }
+
+    /// <summary>
+    /// Returns the browser's still-pending Login session when the bind cookie names one and
+    /// presents its nonce; null (mint fresh) otherwise — including for legacy nonce-only
+    /// cookies set before the "{sessionId}.{nonce}" format shipped.
+    /// </summary>
+    private Nip46Session? TryReuseBoundSession()
+    {
+        var cookie = Request.Cookies[BindCookieName];
+        if (cookie is null)
+            return null;
+        var dot = cookie.IndexOf('.');
+        if (dot <= 0 || dot == cookie.Length - 1)
+            return null;
+        return _nostrLoginService.TryReuseSession(cookie[..dot], cookie[(dot + 1)..]);
+    }
+
+    /// <summary>
+    /// The nonce portion of the bind cookie: the part after the dot in the current
+    /// "{sessionId}.{nonce}" format, or the whole value for legacy nonce-only cookies set
+    /// before that format shipped (their sessions must still be able to complete).
+    /// </summary>
+    private string? PresentedBindNonce()
+    {
+        var cookie = Request.Cookies[BindCookieName];
+        if (cookie is null)
+            return null;
+        var dot = cookie.IndexOf('.');
+        return dot >= 0 ? cookie[(dot + 1)..] : cookie;
     }
 
     [AllowAnonymous]
@@ -216,7 +267,7 @@ public class UINostrLoginController : Controller
         }
 
         // Approved. M2: enforce browser-origin binding before issuing any cookie.
-        var presentedNonce = Request.Cookies[BindCookieName];
+        var presentedNonce = PresentedBindNonce();
         if (session.BindingNonce is not null &&
             !NostrLoginService.BindingNonceMatches(session.BindingNonce, presentedNonce))
         {
@@ -232,9 +283,10 @@ public class UINostrLoginController : Controller
         if (user is null)
         {
             // The auth event verified but the key maps to no account: a stranger/prober, not a
-            // member. Distinct warn so forensics can tell the two apart at a glance.
-            _logger.LogWarning("NostrLogin session {SessionId}: verified but no linked user for pubkey {PubkeyPrefix}",
-                session.Id, NostrLoginService.TruncatePubkey(session.UserPubkey));
+            // member. Distinct warn so forensics can tell the two apart at a glance. Full pubkey
+            // + npub (pubkeys are public; truncating only helps an attacker stay anonymous).
+            _logger.LogWarning("NostrLogin session {SessionId}: verified but no linked user for pubkey {Pubkey} (npub {Npub})",
+                session.Id, session.UserPubkey, session.UserPubkey?.ToNpub());
             return Json(new { status = "failed", error = resolveError });
         }
 
@@ -366,8 +418,8 @@ public class UINostrLoginController : Controller
         var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
         if (user is null)
         {
-            _logger.LogWarning("NostrLogin NIP-98 login: verified but no linked user for pubkey {PubkeyPrefix}",
-                NostrLoginService.TruncatePubkey(signed.PublicKey));
+            _logger.LogWarning("NostrLogin NIP-98 login: verified but no linked user for pubkey {Pubkey} (npub {Npub})",
+                signed.PublicKey, signed.PublicKey?.ToNpub());
             return Json(new { status = "failed", error = resolveError });
         }
 
@@ -437,8 +489,8 @@ public class UINostrLoginController : Controller
         var (user, resolveError) = await ResolveOrCreateUser(signed.PublicKey!.ToLowerInvariant());
         if (user is null)
         {
-            _logger.LogWarning("NostrLogin NIP-98 login link: verified but no linked user for pubkey {PubkeyPrefix}",
-                NostrLoginService.TruncatePubkey(signed.PublicKey));
+            _logger.LogWarning("NostrLogin NIP-98 login link: verified but no linked user for pubkey {Pubkey} (npub {Npub})",
+                signed.PublicKey, signed.PublicKey?.ToNpub());
             return Json(new { status = "failed", error = resolveError });
         }
 

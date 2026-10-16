@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NBitcoin.Secp256k1;
@@ -26,12 +27,12 @@ namespace BTCPayServer.Plugins.NostrLogin.Tests;
 /// </summary>
 public class TwoFactorGateTests
 {
-    private const string TestHost = "nostr.test";
-    private static readonly string LoginUrl = $"https://{TestHost}/login/nostr/nip98";
+    internal const string TestHost = "nostr.test";
+    internal static readonly string LoginUrl = $"https://{TestHost}/login/nostr/nip98";
 
     // --- fakes (no mocking framework in this project) ---
 
-    private class FakeSettingsRepository : ISettingsRepository
+    internal class FakeSettingsRepository : ISettingsRepository
     {
         public ConcurrentDictionary<string, object> Store { get; } = new();
 
@@ -48,7 +49,7 @@ public class TwoFactorGateTests
             => throw new NotSupportedException();
     }
 
-    private class FakeUserStore : IUserStore<ApplicationUser>
+    internal class FakeUserStore : IUserStore<ApplicationUser>
     {
         public void Dispose() { }
         public Task<string> GetUserIdAsync(ApplicationUser user, CancellationToken ct) => Task.FromResult(user.Id);
@@ -63,7 +64,7 @@ public class TwoFactorGateTests
         public Task<ApplicationUser?> FindByNameAsync(string normalizedUserName, CancellationToken ct) => throw new NotSupportedException();
     }
 
-    private class FakeUserManager : UserManager<ApplicationUser>
+    internal class FakeUserManager : UserManager<ApplicationUser>
     {
         private readonly Dictionary<string, ApplicationUser> _byId;
 
@@ -75,13 +76,13 @@ public class TwoFactorGateTests
             => Task.FromResult(_byId.TryGetValue(userId, out var u) ? u : null);
     }
 
-    private class FakeClaimsPrincipalFactory : IUserClaimsPrincipalFactory<ApplicationUser>
+    internal class FakeClaimsPrincipalFactory : IUserClaimsPrincipalFactory<ApplicationUser>
     {
         public Task<ClaimsPrincipal> CreateAsync(ApplicationUser user)
             => Task.FromResult(new ClaimsPrincipal(new ClaimsIdentity("test")));
     }
 
-    private class FakeSchemeProvider : IAuthenticationSchemeProvider
+    internal class FakeSchemeProvider : IAuthenticationSchemeProvider
     {
         public void AddScheme(AuthenticationScheme scheme) { }
         public void RemoveScheme(string name) { }
@@ -97,13 +98,13 @@ public class TwoFactorGateTests
             => Task.FromResult(Enumerable.Empty<AuthenticationScheme>());
     }
 
-    private class FakeUserConfirmation : IUserConfirmation<ApplicationUser>
+    internal class FakeUserConfirmation : IUserConfirmation<ApplicationUser>
     {
         public Task<bool> IsConfirmedAsync(UserManager<ApplicationUser> manager, ApplicationUser user)
             => Task.FromResult(true);
     }
 
-    private class FakeSignInManager : SignInManager<ApplicationUser>
+    internal class FakeSignInManager : SignInManager<ApplicationUser>
     {
         private readonly bool _twoFactorEnabled;
 
@@ -128,7 +129,7 @@ public class TwoFactorGateTests
     }
 
     /// <summary>Records the schemes signed in on the HttpContext (the 2FA hand-off uses IdentityConstants.TwoFactorUserIdScheme).</summary>
-    private class FakeAuthenticationService : IAuthenticationService
+    internal class FakeAuthenticationService : IAuthenticationService
     {
         public List<string> SignInSchemes { get; } = new();
 
@@ -144,7 +145,7 @@ public class TwoFactorGateTests
         public Task SignOutAsync(HttpContext context, string? scheme, AuthenticationProperties? properties) => throw new NotSupportedException();
     }
 
-    private class FakeServiceProvider : IServiceProvider
+    internal class FakeServiceProvider : IServiceProvider
     {
         private readonly IAuthenticationService _auth;
         public FakeServiceProvider(IAuthenticationService auth) => _auth = auth;
@@ -152,7 +153,7 @@ public class TwoFactorGateTests
             => serviceType == typeof(IAuthenticationService) ? _auth : null;
     }
 
-    private class FakeSession : ISession
+    internal class FakeSession : ISession
     {
         private readonly Dictionary<string, byte[]> _data = new();
         public bool IsAvailable => true;
@@ -166,7 +167,7 @@ public class TwoFactorGateTests
         public bool TryGetValue(string key, out byte[] value) => _data.TryGetValue(key, out value!);
     }
 
-    private class FakeProfilePictureService : NostrProfilePictureService
+    internal class FakeProfilePictureService : NostrProfilePictureService
     {
         public FakeProfilePictureService() : base(null!, NullLogger<NostrProfilePictureService>.Instance) { }
         public override void SyncInBackground(string userId, string pubkey) { }
@@ -174,7 +175,7 @@ public class TwoFactorGateTests
 
     // --- scaffolding ---
 
-    private sealed class Rig
+    internal sealed class Rig
     {
         public required UINostrLoginController Controller { get; init; }
         public required FakeSignInManager SignIn { get; init; }
@@ -184,21 +185,28 @@ public class TwoFactorGateTests
         public required string Pubkey { get; init; }
     }
 
-    private static async Task<(ECPrivKey Key, string Pubkey)> NewKey()
+    internal static async Task<(ECPrivKey Key, string Pubkey)> NewKey()
     {
         await Task.CompletedTask;
         var key = NostrExtensions.ParseKey(RandomNumberGenerator.GetBytes(32));
         return (key, key.CreateXOnlyPubKey().ToHex());
     }
 
-    private static Rig BuildRig(string pubkey, bool twoFactorEnabled, NostrLoginService service,
-        Nip98ReplayStore? replayStore = null, string? bindCookieNonce = null)
+    internal static Rig BuildRig(string pubkey, bool twoFactorEnabled, NostrLoginService service,
+        Nip98ReplayStore? replayStore = null, string? bindCookieNonce = null,
+        ILogger<UINostrLoginController>? logger = null)
     {
         var user = new ApplicationUser { Id = "user-1", UserName = "a@b.c", Email = "a@b.c" };
         var repo = new FakeSettingsRepository();
         repo.Store[typeof(NostrLoginUserMap).Name] = new NostrLoginUserMap
         {
             PubkeyToUserId = new Dictionary<string, string> { [pubkey] = user.Id }
+        };
+        // Blackhole relay so controller actions that create sessions (Login GET) never open
+        // real websockets in tests.
+        repo.Store[typeof(NostrLoginSettings).Name] = new NostrLoginSettings
+        {
+            Relays = new List<string> { "wss://10.255.255.1:9" }
         };
 
         var auth = new FakeAuthenticationService();
@@ -226,14 +234,14 @@ public class TwoFactorGateTests
             userService: null!,
             repo,
             new PoliciesSettings(),
-            NullLogger<UINostrLoginController>.Instance)
+            logger ?? NullLogger<UINostrLoginController>.Instance)
         {
             ControllerContext = new ControllerContext { HttpContext = http }
         };
         return new Rig { Controller = controller, SignIn = signIn, Auth = auth, HttpContext = http, User = user, Pubkey = pubkey };
     }
 
-    private static async Task<string> SignEventBase64(ECPrivKey key, string pubkey, string method)
+    internal static async Task<string> SignEventBase64(ECPrivKey key, string pubkey, string method)
     {
         var evt = new NostrEvent
         {
@@ -248,7 +256,7 @@ public class TwoFactorGateTests
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(evt)));
     }
 
-    private static JsonElement JsonOf(IActionResult result)
+    internal static JsonElement JsonOf(IActionResult result)
     {
         var json = Assert.IsType<JsonResult>(result);
         return JsonSerializer.SerializeToElement(json.Value);
