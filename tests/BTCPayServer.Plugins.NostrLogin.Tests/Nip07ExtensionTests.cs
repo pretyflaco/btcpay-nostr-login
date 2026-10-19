@@ -130,6 +130,25 @@ public class Nip07ExtensionTests
         Assert.Equal("approved", Status(await s.Rig.Controller.ExtensionLogin(s.Session.Id, good)));
     }
 
+    /// <summary>Malformed events must be rejected cleanly on the NIP-07 endpoints too: a throw
+    /// would let BTCPay core disable the plugin and restart the server (see MalformedEventTests;
+    /// the 2026-10-19 production incident hit exactly this endpoint).</summary>
+    [Theory]
+    [MemberData(nameof(MalformedEventTests.Cases), MemberType = typeof(MalformedEventTests))]
+    public async Task MalformedEvent_RejectedWithoutThrowing(string kind)
+    {
+        var s = LoginSetup();
+        var login = await s.Rig.Controller.ExtensionLogin(s.Session.Id,
+            MalformedEventTests.Build(kind, LoginUrl(s.Session.Id), "POST"));
+        Assert.Equal("failed", Status(login));
+        Assert.Equal(0, s.Rig.SignIn.FullSignInCount);
+
+        var (l, link) = await LinkSetup();
+        var linked = await l.Rig.Controller.ExtensionLink(link.Id,
+            MalformedEventTests.Build(kind, LinkUrl(link.Id), "POST"));
+        Assert.Equal("failed", Status(linked));
+    }
+
     [Fact]
     public async Task OtherBrowser_WithoutBindCookie_Rejected()
     {
