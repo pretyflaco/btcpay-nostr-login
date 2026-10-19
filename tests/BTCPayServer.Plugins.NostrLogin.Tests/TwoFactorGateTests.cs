@@ -183,6 +183,7 @@ public class TwoFactorGateTests
         public required DefaultHttpContext HttpContext { get; init; }
         public required ApplicationUser User { get; init; }
         public required string Pubkey { get; init; }
+        public required FakeSettingsRepository Repo { get; init; }
     }
 
     internal static async Task<(ECPrivKey Key, string Pubkey)> NewKey()
@@ -196,7 +197,8 @@ public class TwoFactorGateTests
         Nip98ReplayStore? replayStore = null, string? bindCookieNonce = null,
         ILogger<UINostrLoginController>? logger = null)
     {
-        var user = new ApplicationUser { Id = "user-1", UserName = "a@b.c", Email = "a@b.c" };
+        // PasswordHash set: core's DefaultLoginExtension refuses accounts without one.
+        var user = new ApplicationUser { Id = "user-1", UserName = "a@b.c", Email = "a@b.c", PasswordHash = "x" };
         var repo = new FakeSettingsRepository();
         repo.Store[typeof(NostrLoginUserMap).Name] = new NostrLoginUserMap
         {
@@ -231,14 +233,16 @@ public class TwoFactorGateTests
             new FakeProfilePictureService(),
             signIn,
             userManager,
-            userService: null!,
+            // Real CanLogin gate: it only consults the login extensions, so the other deps are unused.
+            new UserService(null!, null!, null!, null!, null!, null!,
+                [new UserService.DefaultLoginExtension()], NullLogger<UserService>.Instance),
             repo,
             new PoliciesSettings(),
             logger ?? NullLogger<UINostrLoginController>.Instance)
         {
             ControllerContext = new ControllerContext { HttpContext = http }
         };
-        return new Rig { Controller = controller, SignIn = signIn, Auth = auth, HttpContext = http, User = user, Pubkey = pubkey };
+        return new Rig { Controller = controller, SignIn = signIn, Auth = auth, HttpContext = http, User = user, Pubkey = pubkey, Repo = repo };
     }
 
     internal static async Task<string> SignEventBase64(ECPrivKey key, string pubkey, string method)

@@ -474,6 +474,16 @@ public class NostrLoginService : IDisposable
     /// instance URL and service image (NIP-46 <c>url</c>/<c>image</c> params) so the signer can
     /// show a recognisable avatar and tell instances apart.
     /// </summary>
+    /// <summary>
+    /// Budget for the encoded <c>relay=</c> params of the connect URI. Everything else is at most
+    /// ~800 chars (with a 253-char host in name/url), and a QR code (ECC level Q) holds ~1660 bytes.
+    /// Enforced when admins save relays; asserted by a test against the real QR encoder.
+    /// </summary>
+    internal const int MaxRelayParamsLength = 800;
+
+    internal static int RelayParamsLength(System.Collections.Generic.IEnumerable<string> relays) =>
+        string.Join("&", relays.Select(r => "relay=" + Uri.EscapeDataString(r))).Length;
+
     internal static string BuildConnectUri(string clientPubkey, string[] relays, string secret, string appName,
         string? appUrl = null, string? imageUrl = null, string perms = "sign_event:27235,get_public_key")
     {

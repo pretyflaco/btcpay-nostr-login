@@ -37,8 +37,12 @@ else
     <p class="text-secondary">No Nostr key is linked to this account yet.</p>
 }
 
-@if (Model.LinkSession is null)
+@if (Model.LinkSession is null || Model.LinkSession.InitialError is not null)
 {
+    @if (Model.LinkSession?.InitialError is not null)
+    {
+        <div class="alert alert-danger" id="NostrError">@Model.LinkSession.InitialError</div>
+    }
     <form method="post" asp-action="StartLink">
         <button type="submit" class="btn btn-primary" id="StartLink">Link a Nostr key</button>
     </form>
