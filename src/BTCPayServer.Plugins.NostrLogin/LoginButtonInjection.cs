@@ -11,7 +11,7 @@ namespace BTCPayServer.Plugins.NostrLogin;
 /// <summary>
 /// Core Login.cshtml has no ui-extension-point and compiled core views cannot be
 /// shadowed by plugin views (first-registered application part wins). This startup
-/// filter injects a "NostrConnect" button into the alternative sign-in row of
+/// filter injects a "Nostr Login" button into the alternative sign-in row of
 /// GET /login responses by anchored string rewrite. Degrades gracefully: if the
 /// anchor is not found, the page is served unchanged.
 /// </summary>
@@ -108,9 +108,9 @@ public class LoginButtonInjectionMiddleware
         // third drop to its own full-width line on mobile. CSP on /login only restricts
         // script-src, so an inline <style> is permitted.
         var button =
-            $"<a href=\"{href}\" class=\"btn btn-outline-secondary w-100 nostr-login-btn\" id=\"nostr-login-btn\" title=\"Sign in with a NIP-46 Nostr signer\">" +
+            $"<a href=\"{href}\" class=\"btn btn-outline-secondary w-100 nostr-login-btn\" id=\"nostr-login-btn\" title=\"Sign in with Nostr: browser extension or signer app\">" +
             $"<svg role=\"img\" class=\"icon icon-social-nostr\"><use href=\"{pathBase}/img/icon-sprite.svg#social-nostr\"></use></svg>" +
-            "<span>NostrConnect</span></a>" +
+            "<span>Nostr Login</span></a>" +
             "<style>" +
             "#login-form .d-flex.gap-2{flex-wrap:wrap;}" +
             "#login-form .d-flex.gap-2>.btn{flex:1 1 120px;}" +

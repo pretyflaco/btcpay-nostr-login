@@ -1,0 +1,85 @@
+@model BTCPayServer.Plugins.NostrLogin.NostrLoginViewModel
+@* NIP-07 browser-extension signer (keys.band, Alby, nos2x…). Hidden until window.nostr shows up;
+   signs a NIP-98 event bound to ExtensionAuthUrl + the session challenge and posts it there. *@
+<div id="NostrExtension" hidden
+     data-auth-url="@Model.ExtensionAuthUrl"
+     data-challenge="@Model.ExtensionChallenge"
+     data-prompt="@Model.ExtensionPrompt"
+     data-return-url="@Model.ReturnUrl">
+    @Html.AntiForgeryToken()
+    <button type="button" class="btn btn-primary" id="NostrExtensionButton">@Model.ExtensionButtonLabel</button>
+    <p class="text-muted mt-2 mb-0">
+        <small>Uses your Nostr browser extension (NIP-07), such as keys.band, Alby or nos2x.</small>
+    </p>
+    <div class="alert alert-danger mt-3" id="NostrExtensionError" hidden></div>
+    <div class="d-flex align-items-center my-4 text-secondary">
+        <hr class="flex-grow-1 my-0" /><span class="mx-3">or use a signer app</span><hr class="flex-grow-1 my-0" />
+    </div>
+</div>
+<script>
+    (function () {
+        var box = document.getElementById("NostrExtension");
+        var button = document.getElementById("NostrExtensionButton");
+        var errorBox = document.getElementById("NostrExtensionError");
+        var label = button.textContent;
+
+        // Extensions inject window.nostr at or after document_end; give them a moment.
+        var attempts = 0;
+        (function detect() {
+            if (window.nostr && typeof window.nostr.signEvent === "function") {
+                box.hidden = false;
+            } else if (++attempts < 30) {
+                setTimeout(detect, 100);
+            }
+        })();
+
+        function fail(message) {
+            errorBox.textContent = message;
+            errorBox.hidden = false;
+            button.disabled = false;
+            button.textContent = label;
+        }
+
+        button.addEventListener("click", async function () {
+            errorBox.hidden = true;
+            button.disabled = true;
+            button.textContent = "Waiting for your extension\u2026";
+
+            var signed;
+            try {
+                signed = await window.nostr.signEvent({
+                    kind: 27235,
+                    created_at: Math.floor(Date.now() / 1000),
+                    content: box.dataset.prompt,
+                    tags: [["u", box.dataset.authUrl], ["method", "POST"], ["challenge", box.dataset.challenge]]
+                });
+            } catch (e) {
+                return fail("The extension did not sign the request" + (e && e.message ? ": " + e.message : "."));
+            }
+
+            var token = box.querySelector('input[name="__RequestVerificationToken"]').value;
+            var body = new URLSearchParams();
+            body.append("event", JSON.stringify(signed));
+            body.append("__RequestVerificationToken", token);
+            if (box.dataset.returnUrl) body.append("returnUrl", box.dataset.returnUrl);
+
+            var data;
+            try {
+                var response = await fetch(box.dataset.authUrl, {
+                    method: "POST",
+                    body: body,
+                    credentials: "same-origin",
+                    headers: { "RequestVerificationToken": token }
+                });
+                data = await response.json();
+            } catch (e) {
+                return fail("Sign-in request failed. Reload the page and try again.");
+            }
+            if ((data.status === "approved" || data.status === "2fa_required") && data.redirect) {
+                window.location.href = data.redirect;
+                return;
+            }
+            fail(data.error || "Sign-in failed.");
+        });
+    })();
+</script>
