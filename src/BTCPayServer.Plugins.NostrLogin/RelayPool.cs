@@ -151,7 +151,7 @@ internal sealed class RelayPool : IDisposable
     {
         if (_clients.ContainsKey(relay))
             return;
-        var client = new NostrClient(new Uri(relay));
+        var client = new CappedNostrClient(new Uri(relay));
         try
         {
             using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
