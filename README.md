@@ -4,9 +4,9 @@
 
 # Nostr Login for BTCPay Server
 
-This plugin lets users sign in to BTCPay Server with a **NIP-46 Nostr remote signer** (Nostr Connect) — scan a QR code with a signer app such as [Amber](https://github.com/greenart7c3/Amber), approve once, and you are logged in. No password, no email, and the private key never leaves the signer.
+This plugin lets users sign in to BTCPay Server with Nostr — either with a **NIP-46 remote signer** (Nostr Connect: scan a QR code with a signer app such as [Amber](https://github.com/greenart7c3/Amber)) or with a **NIP-07 browser extension** such as [keys.band](https://keys.band), [Alby](https://getalby.com) or nos2x. Approve once and you are logged in. No password, no email, and the private key never leaves the signer.
 
-It is **purely additive**: "Sign in with Nostr" appears as a third option next to Passkey and LoginCode, and password sign-in keeps working.
+It is **purely additive**: "Nostr Login" appears as a third option next to Passkey and LoginCode, and password sign-in keeps working.
 
 ## Usage
 
@@ -14,11 +14,13 @@ It is **purely additive**: "Sign in with Nostr" appears as a third option next t
    Available Plugins, install it, and restart your server.
    a. Nostr Login requires BTCPay Server v2.4.2 or newer.
    b. The plugin is additive — it does not disable or replace password, Passkey, or LoginCode sign-in.
-2. Link a Nostr key to your account: navigate to Account > Nostr, click "Link a Nostr key", and scan the QR code
-   with a NIP-46 signer app (e.g. Amber). Approve the request to prove possession of the key.
-3. Sign out, then on the login page choose **NostrConnect** (next to Passkey and LoginCode).
-4. A QR code is displayed. Scan it with your signer app and approve the sign-in request. You are logged in — the
-   plugin issues the standard BTCPay session cookie.
+2. Link a Nostr key to your account: navigate to Account > Nostr, click "Link a Nostr key", then either click
+   **Link with browser extension** (shown when a NIP-07 extension is installed) or scan the QR code with a NIP-46
+   signer app (e.g. Amber). Approve the request to prove possession of the key.
+3. Sign out, then on the login page choose **Nostr Login** (next to Passkey and LoginCode).
+4. Click **Sign in with browser extension** (shown when a NIP-07 extension is installed), or scan the QR code with
+   your signer app, and approve the sign-in request. You are logged in — the plugin issues the standard BTCPay
+   session cookie (accounts with two-factor authentication continue to BTCPay's second-factor step).
 5. Admins can configure the plugin under Server Settings > Nostr Login: set the relays used for sign-in and
    optionally allow account creation via Nostr sign-in.
 
@@ -45,6 +47,25 @@ The signer app connects over the listed relays (NIP-46 messages are exchanged as
 
 The plugin then verifies the returned event: correct kind, the pubkey matches the signer's user pubkey, the `challenge` tag matches, the timestamp is fresh, and the Schnorr signature is valid. Only then is the session cookie issued — after the same `CanLogin` policy checks BTCPay applies to every login.
 
+### Browser extensions (NIP-07)
+
+When a [NIP-07](https://github.com/nostr-protocol/nips/blob/master/07.md) extension is installed (`window.nostr`), the same page offers **Sign in with browser extension**. No relays are involved: the page asks the extension to sign a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event bound to the session and posts it back:
+
+```json
+{
+  "kind": 27235,
+  "created_at": 1723200000,
+  "content": "Sign in to BTCPay Server at pay.example.com",
+  "tags": [
+    ["u", "https://pay.example.com/login/nostr/nip07/<session-id>"],
+    ["method", "POST"],
+    ["challenge", "<per-session challenge>"]
+  ]
+}
+```
+
+The plugin verifies the signature, the `u`/`method` binding, the per-session challenge, freshness and single use, checks the browser binding cookie, and then completes the sign-in exactly like the QR flow (2FA hand-off and `CanLogin` included). Linking a key from Account > Nostr works the same way.
+
 ## Routes
 
 All routes are cookie-authenticated MVC endpoints. **This version does not expose a Greenfield/REST API.**
@@ -53,12 +74,14 @@ All routes are cookie-authenticated MVC endpoints. **This version does not expos
 | --- | --- | --- |
 | `/login/nostr` | GET | Sign-in page: renders the Nostr Connect QR and polls for approval. |
 | `/login/nostr/status/{sessionId}` | GET | Poll endpoint returning `pending` / `approved` / `failed`. |
+| `/login/nostr/nip07/{sessionId}` | POST | Complete sign-in with a NIP-07 browser-extension proof. |
 | `/account/nostr` | GET | Manage linked Nostr keys for the current account. |
-| `/account/nostr/link` | POST | Start a link session (proof of possession via NIP-46). |
+| `/account/nostr/link` | POST | Start a link session (proof of possession via NIP-46 or a NIP-07 extension). |
+| `/account/nostr/link/nip07/{sessionId}` | POST | Complete key linking with a NIP-07 browser-extension proof. |
 | `/account/nostr/unlink` | POST | Remove a linked key. |
 | `/server/nostr-login` | GET/POST | Admin settings: relays and account-creation toggle (requires `CanModifyServerSettings`). |
 
-The "NostrConnect" button on the core login page is injected by a startup filter, because BTCPay's `Login.cshtml` has no UI extension point. It degrades gracefully — if the expected markup is not found, the login page is served unchanged.
+The "Nostr Login" button on the core login page is injected by a startup filter, because BTCPay's `Login.cshtml` has no UI extension point. It degrades gracefully — if the expected markup is not found, the login page is served unchanged.
 
 ## Compatible signers
 
@@ -68,9 +91,12 @@ Any NIP-46 signer that can sign a `kind:22242` event works. Tested with:
     * [F-Droid](https://f-droid.org/packages/com.greenart7c3.nostrsigner/)
     * Also available via the Google Play Store and Obtainium.
 
+Any NIP-07 browser extension that implements `window.nostr.signEvent` works for the extension path, e.g. **keys.band** (Chromium), **Alby** (Chrome, Firefox) and **nos2x**.
+
 ## Security
 
-* **Anti-QRLjacking** — each login session is bound to the browser that rendered the QR via an HttpOnly, `SameSite=Strict` cookie; the session cookie is only issued to that browser.
+* **Anti-QRLjacking** — each login session is bound to the browser that rendered the QR via an HttpOnly, `SameSite=Strict` cookie; the session cookie is only issued to that browser (QR and browser-extension paths alike).
+* **Origin binding caveat** — like NIP-46 signers, NIP-07 extensions do not bind a signature to the website that requested it, so a real-time phishing page could relay a challenge. Read the extension's prompt (it shows the target host) and enable 2FA for sensitive accounts; key proof never bypasses 2FA.
 * **Rate limiting** — anonymous sign-in session creation is throttled per IP (10/minute).
 * **Key hygiene** — ephemeral per-session keys are zeroized and disposed the moment the flow resolves.
 * **CSRF** — all state-changing endpoints are protected by BTCPay's global antiforgery filter.

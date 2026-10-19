@@ -90,6 +90,15 @@ cd submodules/btcpayserver/BTCPayServer.Tests && docker compose up -d dev
   them in Server Settings → Nostr Login (stored via `ISettingsRepository`;
   overrides win over defaults). Tests reference `DefaultRelays` dynamically, so
   changing the list does not break them.
+- **NIP-07 browser extensions** (keys.band, Alby, nos2x) piggyback on the same session:
+  every session carries an `ExtensionChallenge`; the page (`_ExtensionSigner.cshtml`, shown only
+  when `window.nostr` appears) signs a NIP-98 event (u = `/login/nostr/nip07/{id}` or
+  `/account/nostr/link/nip07/{id}`, method POST, challenge tag) and posts it. No relays involved.
+  Login completion is shared with the QR poller (`CompleteLoginAsync`: user resolution, 2FA
+  hand-off, CanLogin) and linking with `CompleteLinkAsync` (atomic ownership claim) — keep both
+  paths going through these helpers. A failed NIP-46 leg (e.g. relays down) must not consume the
+  session (the status pollers no longer remove Failed sessions), and a bad extension proof must
+  not consume it either.
 - **Diagnostics:** verbose NIP-46 handshake logs ("DIAG" lines) are gated behind
   `NostrLoginSettings.EnableDiagnosticLogging` (admin toggle, **off by default**).
   Keep them gated — do not ship them always-on, and do not delete them.

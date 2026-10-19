@@ -29,6 +29,14 @@ public class NostrLoginViewModel
 
     /// <summary>Set when the session was rejected before it could start (e.g. rate limited).</summary>
     public string? InitialError { get; init; }
+
+    // NIP-07 (browser extension) path: the page signs a NIP-98 event for ExtensionAuthUrl with
+    // ExtensionChallenge as its challenge tag and posts it there.
+    public string ExtensionAuthUrl { get; init; } = "";
+    public string ExtensionChallenge { get; init; } = "";
+    /// <summary>Human-readable event content, shown by the extension's approval prompt.</summary>
+    public string ExtensionPrompt { get; init; } = "";
+    public string ExtensionButtonLabel { get; init; } = "";
 }
 
 public class NostrAccountViewModel
@@ -167,9 +175,18 @@ public class UINostrLoginController : Controller
     /// </summary>
     private string Nip98LoginUrl() => $"{Request.Scheme}://{Request.Host}/login/nostr/nip98";
 
+    /// <summary>NIP-98 <c>u</c> URL (and POST target) for a NIP-07 extension login proof.</summary>
+    private string ExtensionLoginUrl(string sessionId) =>
+        $"{Request.Scheme}://{Request.Host}{Request.PathBase}/login/nostr/nip07/{sessionId}";
+
+    /// <summary>NIP-98 <c>u</c> URL (and POST target) for a NIP-07 extension link proof.</summary>
+    private string ExtensionLinkUrl(string sessionId) =>
+        $"{Request.Scheme}://{Request.Host}{Request.PathBase}/account/nostr/link/nip07/{sessionId}";
+
     private NostrLoginViewModel ToViewModel(Nip46Session session, string statusUrl, string? returnUrl = null)
     {
         var failedUpFront = session.Status == Nip46SessionStatus.Failed;
+        var isLogin = session.Purpose == Nip46SessionPurpose.Login;
         var qr = failedUpFront ? null : TryGenerateQrDataUri(session.ConnectUri);
         var qrFailed = !failedUpFront && qr is null;
         if (qrFailed)
@@ -191,7 +208,13 @@ public class UINostrLoginController : Controller
             // may race to set its own (misleading) timeout error on the session.
             InitialError = qrFailed
                 ? "Could not render the sign-in QR code. An administrator should check the Nostr Login relay settings."
-                : failedUpFront ? session.Error : null
+                : failedUpFront ? session.Error : null,
+            ExtensionAuthUrl = isLogin ? ExtensionLoginUrl(session.Id) : ExtensionLinkUrl(session.Id),
+            ExtensionChallenge = session.ExtensionChallenge,
+            ExtensionPrompt = isLogin
+                ? $"Sign in to BTCPay Server at {AdvertisedHost()}"
+                : $"Link this Nostr key to your BTCPay Server account at {AdvertisedHost()}",
+            ExtensionButtonLabel = isLogin ? "Sign in with browser extension" : "Link with browser extension"
         };
     }
 
@@ -314,7 +337,9 @@ public class UINostrLoginController : Controller
                     ? Json(new { status = "auth_required", authUrl = session.AuthUrl })
                     : Json(new { status = "pending" });
             case Nip46SessionStatus.Failed:
-                _nostrLoginService.RemoveSession(session.Id);
+                // Not removed: a failed NIP-46 leg (e.g. no relay reachable) must not take the
+                // NIP-07 extension path on the same page down with it. A Failed session can never
+                // be approved via NIP-46 again; Cleanup sweeps it.
                 return Json(new { status = "failed", error = session.Error });
         }
 
@@ -331,18 +356,29 @@ public class UINostrLoginController : Controller
             });
         }
 
-        var (user, resolveError) = await ResolveOrCreateUser(session.UserPubkey!);
+        return await CompleteLoginAsync(session, session.UserPubkey!, returnUrl);
+    }
+
+    /// <summary>
+    /// Completes a browser login for a key proven on a bound session — shared by the NIP-46 status
+    /// poller and the NIP-07 extension endpoint so both apply the identical gates: user
+    /// resolution (incl. auto-creation policy), 2FA hand-off, CanLogin, then the sign-in cookie.
+    /// Callers must have verified the key proof AND the M2 browser binding first.
+    /// </summary>
+    private async Task<IActionResult> CompleteLoginAsync(Nip46Session session, string pubkey, string? returnUrl)
+    {
+        var (user, resolveError) = await ResolveOrCreateUser(pubkey);
         if (user is null)
         {
             // The auth event verified but the key maps to no account: a stranger/prober, not a
             // member. Distinct warn so forensics can tell the two apart at a glance. Full pubkey
             // + npub (pubkeys are public; truncating only helps an attacker stay anonymous).
             _logger.LogWarning("NostrLogin session {SessionId}: verified but no linked user for pubkey {Pubkey} (npub {Npub})",
-                session.Id, session.UserPubkey, session.UserPubkey?.ToNpub());
+                session.Id, pubkey, pubkey.ToNpub());
             return Json(new { status = "failed", error = resolveError });
         }
 
-        _profilePictureService.SyncInBackground(user.Id, session.UserPubkey!);
+        _profilePictureService.SyncInBackground(user.Id, pubkey);
 
         // 2FA hand-off BEFORE any full sign-in: the key proof alone is single-factor. The 2FA
         // cookie is set on this (already browser-bind-verified) response, so only the QR-bound
@@ -366,6 +402,73 @@ public class UINostrLoginController : Controller
         Response.Cookies.Delete(BindCookieName);
         var redirect = SafeReturnUrl(Url, returnUrl);
         return Json(new { status = "approved", redirect });
+    }
+
+    /// <summary>Upper bound on a posted NIP-07 event (real ones are well under 1 KB).</summary>
+    private const int MaxExtensionEventLength = 16 * 1024;
+
+    /// <summary>
+    /// NIP-07 (browser extension: keys.band, Alby, nos2x…) sign-in for a session rendered by
+    /// <see cref="Login"/>. The page asks <c>window.nostr.signEvent</c> for a NIP-98 event (kind
+    /// 27235, <c>u</c> = this URL, <c>method</c> = POST, <c>challenge</c> = the session's
+    /// extension challenge) and posts it here. No relays are involved.
+    ///
+    /// SECURITY: CSRF-protected by core's global UI antiforgery filter (no opt-out), bound to the
+    /// browser that rendered the page via the M2 bind cookie (constant time), bound to this
+    /// session by the challenge and to this URL + method by NIP-98, fresh, single-use (durable
+    /// replay guard) and rate limited per IP. Completion shares <see cref="CompleteLoginAsync"/>
+    /// with the QR flow, so 2FA hand-off and CanLogin are identical. A bad proof does NOT consume
+    /// the session, so nobody can kill a pending login by posting garbage.
+    /// </summary>
+    [AllowAnonymous]
+    [HttpPost("/login/nostr/nip07/{sessionId}")]
+    public async Task<IActionResult> ExtensionLogin(string sessionId, [FromForm(Name = "event")] string? eventJson,
+        [FromForm] string? returnUrl = null)
+    {
+        if (!_nostrLoginService.AllowLogin(RateLimitKey()))
+            return StatusCode(StatusCodes.Status429TooManyRequests,
+                new { status = "failed", error = "Too many sign-in attempts. Please wait a moment and try again." });
+
+        var session = _nostrLoginService.GetSession(sessionId);
+        if (session is not { Purpose: Nip46SessionPurpose.Login } || !NostrLoginService.AcceptsExtensionProof(session))
+            return Json(new { status = "failed", error = "Session expired. Reload the page to try again." });
+
+        if (session.BindingNonce is not null &&
+            !NostrLoginService.BindingNonceMatches(session.BindingNonce, PresentedBindNonce()))
+            return Json(new
+            {
+                status = "failed",
+                error = "Please complete this sign-in in the same browser that displayed the sign-in page."
+            });
+
+        var signed = TryParseEventJson(eventJson);
+        var error = await Nip98.ValidateAsync(signed, signed?.PublicKey ?? "", ExtensionLoginUrl(session.Id), "POST",
+            session.ExtensionChallenge, tryConsume: _replayStore.TryConsumeAsync);
+        if (error is not null)
+        {
+            _logger.LogInformation("NostrLogin session {SessionId}: browser-extension proof rejected: {Error}", session.Id, error);
+            return Unauthorized(new { status = "failed", error });
+        }
+
+        var pubkey = signed!.PublicKey!.ToLowerInvariant();
+        _logger.LogInformation("NostrLogin session {SessionId}: auth event verified for pubkey {PubkeyPrefix} (scheme=Nip07)",
+            session.Id, NostrLoginService.TruncatePubkey(pubkey));
+        return await CompleteLoginAsync(session, pubkey, returnUrl);
+    }
+
+    /// <summary>Parse a posted NIP-07 signed event (raw JSON), or null when absent/oversized/malformed.</summary>
+    internal static NostrEvent? TryParseEventJson(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json) || json.Length > MaxExtensionEventLength)
+            return null;
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<NostrEvent>(json);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -656,25 +759,62 @@ public class UINostrLoginController : Controller
                     ? Json(new { status = "auth_required", authUrl = session.AuthUrl })
                     : Json(new { status = "pending" });
             case Nip46SessionStatus.Failed:
-                _nostrLoginService.RemoveSession(session.Id);
+                // Not removed: the NIP-07 extension path on the same panel may still complete it.
                 return Json(new { status = "failed", error = session.Error });
         }
 
-        var pubkey = session.UserPubkey!;
-        // Ownership check and write under one lock: two concurrent links of the same key must
-        // not both pass the check and race to last-write-wins.
+        return await CompleteLinkAsync(session, session.UserPubkey!, user.Id);
+    }
+
+    /// <summary>
+    /// Links a proven key to the user — shared by the NIP-46 poller and the NIP-07 endpoint.
+    /// Ownership check and write under one lock: two concurrent links of the same key must not
+    /// both pass the check and race to last-write-wins.
+    /// </summary>
+    private async Task<IActionResult> CompleteLinkAsync(Nip46Session session, string pubkey, string userId)
+    {
         var linked = await SettingsMapMutex.TryUpdateAsync<NostrLoginUserMap>(_settingsRepository, m =>
         {
-            if (m.PubkeyToUserId.TryGetValue(pubkey, out var ownerId) && ownerId != user.Id)
+            if (m.PubkeyToUserId.TryGetValue(pubkey, out var ownerId) && ownerId != userId)
                 return false;
-            m.PubkeyToUserId[pubkey] = user.Id;
+            m.PubkeyToUserId[pubkey] = userId;
             return true;
         });
         _nostrLoginService.RemoveSession(session.Id);
         if (!linked)
             return Json(new { status = "failed", error = "This Nostr key is already linked to another account." });
 
+        _logger.LogInformation("NostrLogin session {SessionId}: linked pubkey {PubkeyPrefix} to user {UserId}",
+            session.Id, NostrLoginService.TruncatePubkey(pubkey), userId);
         return Json(new { status = "approved", redirect = Url.Action(nameof(Account)) });
+    }
+
+    /// <summary>
+    /// NIP-07 (browser extension) key linking for a Link session started by <see cref="StartLink"/>.
+    /// Same proof as <see cref="ExtensionLogin"/> (NIP-98 event bound to this URL + POST + the
+    /// session's challenge, fresh, single-use); the session must belong to the signed-in user.
+    /// CSRF-protected by core's global UI antiforgery filter.
+    /// </summary>
+    [Authorize(AuthenticationSchemes = AuthenticationSchemes.Cookie)]
+    [HttpPost("/account/nostr/link/nip07/{sessionId}")]
+    public async Task<IActionResult> ExtensionLink(string sessionId, [FromForm(Name = "event")] string? eventJson)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        var session = _nostrLoginService.GetSession(sessionId);
+        if (user is null || session is not { Purpose: Nip46SessionPurpose.Link } || session.LinkUserId != user.Id
+            || !NostrLoginService.AcceptsExtensionProof(session))
+            return Json(new { status = "failed", error = "Session expired. Reload the page to try again." });
+
+        var signed = TryParseEventJson(eventJson);
+        var error = await Nip98.ValidateAsync(signed, signed?.PublicKey ?? "", ExtensionLinkUrl(session.Id), "POST",
+            session.ExtensionChallenge, tryConsume: _replayStore.TryConsumeAsync);
+        if (error is not null)
+        {
+            _logger.LogInformation("NostrLogin session {SessionId}: browser-extension link proof rejected: {Error}", session.Id, error);
+            return Unauthorized(new { status = "failed", error });
+        }
+
+        return await CompleteLinkAsync(session, signed!.PublicKey!.ToLowerInvariant(), user.Id);
     }
 
     [Authorize(AuthenticationSchemes = AuthenticationSchemes.Cookie)]

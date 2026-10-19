@@ -21,6 +21,7 @@ public class LoginButtonInjectionTests
         Assert.NotNull(result);
         Assert.Contains("id=\"nostr-login-btn\"", result);
         Assert.Contains("href=\"/login/nostr\"", result);
+        Assert.Contains("<span>Nostr Login</span>", result);
         // Injected inside the flex row (before its closing tag)
         Assert.True(result!.IndexOf("nostr-login-btn") < result.LastIndexOf("</div>"));
     }

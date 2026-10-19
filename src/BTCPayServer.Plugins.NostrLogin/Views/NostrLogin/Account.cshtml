@@ -12,8 +12,8 @@
 <partial name="_StatusMessage" />
 
 <p>
-    Link a Nostr key to your account to sign in with a NIP-46 signer app
-    (such as <strong>Amber</strong>) at <code>/login/nostr</code>.
+    Link a Nostr key to your account to sign in at <code>/login/nostr</code> with a NIP-46 signer app
+    (such as <strong>Amber</strong>) or a Nostr browser extension (such as <strong>keys.band</strong> or <strong>Alby</strong>).
 </p>
 
 @if (Model.LinkedPubkeys.Length > 0)
@@ -50,6 +50,7 @@ else
 else
 {
     <div class="text-center border rounded p-4" style="max-width:420px;">
+        <partial name="/Views/NostrLogin/_ExtensionSigner.cshtml" model="Model.LinkSession" />
         <p>Scan with your NIP-46 signer app and approve the request.</p>
         <img src="@Model.LinkSession.QrDataUri" alt="Nostr Connect QR code" class="qr-code rounded" style="width:240px;height:240px;image-rendering:pixelated;" />
         <div class="input-group mt-3">

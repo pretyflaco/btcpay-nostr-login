@@ -52,6 +52,14 @@ public class Nip46Session
     internal string? Challenge22242 { get; set; }
 
     /// <summary>
+    /// NIP-07 (browser extension) challenge: the page asks the extension to sign a NIP-98 event
+    /// carrying this as its <c>challenge</c> tag, so a signed proof is only valid for this
+    /// session (and, for Login, only from the browser holding its bind cookie). Minted with the
+    /// session; independent of the NIP-46 relay flow and its <see cref="Nip98Nonce"/>.
+    /// </summary>
+    internal string ExtensionChallenge { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+
+    /// <summary>
     /// HTTPS auth_url the bound signer asked the user to open to approve (web-signer flow). Surfaced
     /// to the browser by the status poller; cleared once the signer returns the real signed event.
     /// </summary>
@@ -377,6 +385,16 @@ public class NostrLoginService : IDisposable
             return null;
         return session;
     }
+
+    /// <summary>
+    /// Whether a NIP-07 extension proof may still complete this session: within the session
+    /// lifetime and not already completed via NIP-46. Deliberately independent of relay state —
+    /// a session whose relays all failed (Status Failed) still accepts an extension proof, since
+    /// that path needs no relays.
+    /// </summary>
+    internal static bool AcceptsExtensionProof(Nip46Session session) =>
+        session.Status != Nip46SessionStatus.Approved
+        && DateTimeOffset.UtcNow - session.CreatedAt <= SessionLifetime;
 
     public void RemoveSession(string id)
     {
