@@ -171,7 +171,7 @@ public class NostrProfilePictureService
         using var cts = new CancellationTokenSource(RelayFetchTimeout);
         try
         {
-            using var client = new NostrClient(new Uri(relay));
+            using var client = new CappedNostrClient(new Uri(relay));
             await client.ConnectAndWaitUntilConnected(cts.Token);
             var filters = new[]
             {
@@ -196,8 +196,14 @@ public class NostrProfilePictureService
         }
     }
 
-    private static string? ParsePictureUrl(string kind0Content)
+    /// <summary>Real kind-0 profiles are well under this; anything larger is skipped unparsed.
+    /// (The transport-level bound is <see cref="CappedNostrClient.MaxMessageBytes"/>.)</summary>
+    internal const int MaxKind0ContentLength = 64 * 1024;
+
+    internal static string? ParsePictureUrl(string kind0Content)
     {
+        if (kind0Content.Length > MaxKind0ContentLength)
+            return null;
         try
         {
             using var doc = System.Text.Json.JsonDocument.Parse(kind0Content);
