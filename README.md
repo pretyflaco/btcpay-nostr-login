@@ -94,7 +94,13 @@ docker compose up -d dev
 
 Then run BTCPay Server with the `Bitcoin-HTTPS` launch profile; the plugin is loaded via `DEBUG_PLUGINS`.
 
-`tools/FakeSigner` is a minimal NIP-46 signer CLI used to drive the sign-in flow end-to-end in development without a phone.
+`tools/FakeSigner` is a minimal NIP-46 signer CLI used to drive the sign-in flow end-to-end in development without a phone:
+
+```bash
+dotnet run --project tools/FakeSigner -- "<nostrconnect://...>" --key-file ~/.fakesigner-key
+```
+
+The signer key is never passed as an argument or printed. `--key-file` reuses the key in that file, or creates it (mode 0600) on first run, so you can link once and log in again with the same identity. Alternatively set `NOSTR_SIGNER_KEY=<hex>`. With neither, a throwaway key is used.
 
 ## License
 
