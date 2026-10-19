@@ -70,22 +70,22 @@ internal static class Nip98
             || !string.Equals(signed.PublicKey, expectedPubkey, StringComparison.OrdinalIgnoreCase))
             return "Signed event pubkey does not match.";
 
-        var u = signed.GetTaggedData("u").FirstOrDefault();
+        var u = UntrustedEvent.TagValues(signed, "u").FirstOrDefault();
         if (u is null || !UrlMatches(u, expectedUrl))
             return "Signed event 'u' tag does not match the expected URL.";
 
-        var method = signed.GetTaggedData("method").FirstOrDefault();
+        var method = UntrustedEvent.TagValues(signed, "method").FirstOrDefault();
         if (!string.Equals(method, expectedMethod, StringComparison.OrdinalIgnoreCase))
             return "Signed event 'method' tag mismatch.";
 
-        if (expectedNonce is not null && !signed.GetTaggedData("challenge").Contains(expectedNonce))
+        if (expectedNonce is not null && !UntrustedEvent.TagValues(signed, "challenge").Contains(expectedNonce))
             return "Signed event does not contain the expected challenge.";
 
         var age = DateTimeOffset.UtcNow - (signed.CreatedAt ?? DateTimeOffset.MinValue);
         if (age > TimeSpan.FromMinutes(maxAgeMinutes) || age < -FutureTolerance)
             return "Signed event timestamp is out of range.";
 
-        if (!signed.Verify())
+        if (!UntrustedEvent.Verify(signed))
             return "Signed event has an invalid signature.";
 
         // Replay guard LAST: only record a fully-valid id so bogus ids can't poison the store.

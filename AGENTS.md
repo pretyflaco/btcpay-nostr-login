@@ -109,6 +109,14 @@ cd submodules/btcpayserver/BTCPayServer.Tests && docker compose up -d dev
   (`StartTwoFactorIfRequiredAsync` → `/login/second-login`), and the
   non-interactive `POST /login/nostr/nip98` refuses 2FA accounts outright.
   Programmatic access for 2FA accounts = scoped Greenfield API keys.
+- **Never throw on untrusted input.** BTCPay core's `PluginExceptionHandler` DISABLES the
+  plugin and RESTARTS the whole server on any unhandled plugin exception during a request, so
+  a throw on an anonymous endpoint is a remote kill switch (happened in production 2026-10-19:
+  a value-less `["u"]` tag hit NNostr's `GetTaggedData` → `.First()`). Read tags / verify
+  signatures of untrusted events only via `UntrustedEvent` (never NNostr's `GetTaggedData` /
+  `Verify` directly). `[ContainPluginExceptions]` on the controller is the safety net (logs +
+  500 instead of the kill switch) — keep it, and keep `MalformedEventTests` covering every
+  anonymous entry point.
 - **Rate limiting** on anonymous login-session creation (per IP). Ephemeral
   per-session keys are zeroized on resolution.
 - **Auto user creation** is off by default and, when enabled, still honours the
