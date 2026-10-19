@@ -73,6 +73,7 @@ public class Nip46FlowTests
         var service = new NostrLoginService(logger);
         var session = await service.CreateSessionAsync(Nip46SessionPurpose.Login, relays, "NostrLoginTest",
             loginUrl: loginUrl);
+        service.EnsureRelaysStarted(session); // what the page's first status poll does
 
         // Parse the nostrconnect:// URI like a signer app would
         var uri = new Uri(session.ConnectUri);

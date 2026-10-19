@@ -79,6 +79,16 @@ cd submodules/btcpayserver/BTCPayServer.Tests && docker compose up -d dev
   Regressing this to await relays before rendering the QR reintroduces the
   "spinning login tab" bug. There is a test asserting prompt return with
   unreachable relays.
+- **Relays start lazily.** Sessions are created *dormant*; the first status poll
+  (`LoginStatus` / `LinkStatus` → `EnsureRelaysStarted`, CAS-guarded, once) starts
+  `RunSessionAsync`. The pages only poll once the QR is shown, and the QR is only
+  shown once needed (`_ExtensionSigner.cshtml`: no NIP-07 extension within ~0.8 s,
+  or the user picks "signer app"), so no-JS page views (crawlers, probers) and
+  extension sign-ins open no relay connections. Never start relays from the page
+  GET, and never show the QR before polling starts (the connect ack below is
+  one-shot). A dormant session that ends wipes its key in `OnDormantSessionEnded`
+  and reports `no-poll` expiry (feeds the probe counter); `RemoveSession` marks
+  `Removed` so completions are not logged as expiries.
 - **The connect ack is one-shot.** The kind-24133 subscription must be created
   *before* reading events. Keep that ordering in `RunSessionAsync`.
 - **nostrconnect URI** is built in `NostrLoginService.BuildConnectUri`. It emits

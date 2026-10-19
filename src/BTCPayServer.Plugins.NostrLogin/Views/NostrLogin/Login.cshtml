@@ -15,30 +15,37 @@
     else
     {
         <partial name="/Views/NostrLogin/_ExtensionSigner.cshtml" model="Model" />
-        <p>
-            Scan this QR code with a NIP-46 signer app such as
-            <strong>Amber</strong> and approve the sign-in request.
-        </p>
-        <img src="@Model.QrDataUri" alt="Nostr Connect QR code" class="qr-code rounded" style="width:240px;height:240px;image-rendering:pixelated;" />
-        <div class="input-group mt-3">
-            <input type="text" class="form-control" readonly value="@Model.ConnectUri" id="ConnectUri" />
-            <button type="button" class="btn btn-outline-secondary" id="CopyUri">Copy</button>
+        <div class="d-flex align-items-center justify-content-center my-4 text-secondary" id="NostrQrPreparing">
+            <div class="spinner-border spinner-border-sm" role="status"></div>
+            <span class="ms-2">Preparing sign-in&hellip;</span>
         </div>
-        <div class="mt-3">
-            <a href="@Model.ConnectUri" class="btn btn-primary" id="OpenSignerApp">Open signer app</a>
-            <p class="text-muted mt-2 mb-0">
-                <small>On this device? Open your NIP-46 signer app (such as Amber) and approve there — this page completes the sign-in.</small>
+        @* Shown (and polled, which starts the relays server-side) only once the QR is needed. *@
+        <div id="NostrQrSection" hidden>
+            <p>
+                Scan this QR code with a NIP-46 signer app such as
+                <strong>Amber</strong> and approve the sign-in request.
             </p>
+            <img src="@Model.QrDataUri" alt="Nostr Connect QR code" class="qr-code rounded" style="width:240px;height:240px;image-rendering:pixelated;" />
+            <div class="input-group mt-3">
+                <input type="text" class="form-control" readonly value="@Model.ConnectUri" id="ConnectUri" />
+                <button type="button" class="btn btn-outline-secondary" id="CopyUri">Copy</button>
+            </div>
+            <div class="mt-3">
+                <a href="@Model.ConnectUri" class="btn btn-primary" id="OpenSignerApp">Open signer app</a>
+                <p class="text-muted mt-2 mb-0">
+                    <small>On this device? Open your NIP-46 signer app (such as Amber) and approve there — this page completes the sign-in.</small>
+                </p>
+            </div>
+            <div class="d-flex align-items-center justify-content-center mt-4" id="NostrPending">
+                <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
+                <span class="ms-2 text-secondary">Waiting for signer approval&hellip;</span>
+            </div>
+            <div class="alert alert-info mt-4" id="NostrAuthUrl" style="display:none;">
+                Your signer needs an extra approval step.
+                <a href="#" id="NostrAuthUrlLink" target="_blank" rel="noopener">Open your signer to approve</a>.
+            </div>
+            <div class="alert alert-danger mt-4" id="NostrError" style="display:none;"></div>
         </div>
-        <div class="d-flex align-items-center justify-content-center mt-4" id="NostrPending">
-            <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
-            <span class="ms-2 text-secondary">Waiting for signer approval&hellip;</span>
-        </div>
-        <div class="alert alert-info mt-4" id="NostrAuthUrl" style="display:none;">
-            Your signer needs an extra approval step.
-            <a href="#" id="NostrAuthUrlLink" target="_blank" rel="noopener">Open your signer to approve</a>.
-        </div>
-        <div class="alert alert-danger mt-4" id="NostrError" style="display:none;"></div>
         <div class="mt-4">
             <a href="/login" id="BackToLogin">Sign in another way</a>
         </div>
@@ -54,7 +61,8 @@
                 navigator.clipboard.writeText(document.getElementById("ConnectUri").value);
                 this.textContent = "Copied";
             });
-            var timer = setInterval(async function () {
+            var timer;
+            async function poll() {
                 try {
                     var response = await fetch(statusUrl);
                     var data = await response.json();
@@ -76,7 +84,15 @@
                         err.style.display = "block";
                     }
                 } catch (e) { /* transient network error: keep polling */ }
-            }, 2000);
+            }
+            function showQr() {
+                document.getElementById("NostrQrPreparing").hidden = true;
+                document.getElementById("NostrQrSection").hidden = false;
+                poll(); // first poll starts the relays server-side
+                timer = setInterval(poll, 2000);
+            }
+            if (window.__nostrQrNeeded) showQr();
+            else document.addEventListener("nostr-qr-needed", showQr, { once: true });
         })();
     </script>
 }

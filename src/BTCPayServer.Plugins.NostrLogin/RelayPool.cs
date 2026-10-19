@@ -79,6 +79,10 @@ internal sealed class RelayPool : IDisposable
     {
         await Task.WhenAll(_relays.Select(relay => OpenAndSubscribe(relay, ct)));
         var connected = _clients.Count;
+        // Session ended mid-connect (expired, or completed/removed e.g. by a NIP-07 sign-in): the
+        // cancelled connects are not relay failures, so don't report an outage.
+        if (ct.IsCancellationRequested)
+            return connected;
         // One aggregate line per session instead of one warn per failed relay: a single flaky
         // relay (e.g. damus behind Cloudflare returning 503) used to page the alert channel for
         // every session even though the remaining relays carry the handshake fine. Only a total

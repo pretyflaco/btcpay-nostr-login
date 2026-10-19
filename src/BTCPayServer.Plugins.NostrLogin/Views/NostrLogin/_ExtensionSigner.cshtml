@@ -1,6 +1,10 @@
 @model BTCPayServer.Plugins.NostrLogin.NostrLoginViewModel
-@* NIP-07 browser-extension signer (keys.band, Alby, nos2x…). Hidden until window.nostr shows up;
-   signs a NIP-98 event bound to ExtensionAuthUrl + the session challenge and posts it there. *@
+@* NIP-07 browser-extension signer (keys.band, Alby, nos2x…) + the "is the QR needed?" decision.
+
+   Relays are started server-side by the first status poll, and pages only poll once they show
+   the QR. This partial decides when that is: if no extension shows up within ~0.8 s the QR is
+   needed right away; if one does, the QR stays collapsed until the user picks "signer app".
+   Pages wait for it via window.__nostrQrNeeded / the "nostr-qr-needed" event. *@
 <div id="NostrExtension" hidden
      data-auth-url="@Model.ExtensionAuthUrl"
      data-challenge="@Model.ExtensionChallenge"
@@ -12,26 +16,53 @@
         <small>Uses your Nostr browser extension (NIP-07), such as keys.band, Alby or nos2x.</small>
     </p>
     <div class="alert alert-danger mt-3" id="NostrExtensionError" hidden></div>
-    <div class="d-flex align-items-center my-4 text-secondary">
+    <div class="mt-3" id="NostrUseSignerAppRow" hidden>
+        <button type="button" class="btn btn-link" id="NostrUseSignerApp">Use a signer app (QR code) instead</button>
+    </div>
+    <div class="d-flex align-items-center my-4 text-secondary" id="NostrOrDivider" hidden>
         <hr class="flex-grow-1 my-0" /><span class="mx-3">or use a signer app</span><hr class="flex-grow-1 my-0" />
     </div>
 </div>
+<noscript><div class="alert alert-warning">JavaScript is required to sign in with Nostr.</div></noscript>
 <script>
     (function () {
         var box = document.getElementById("NostrExtension");
         var button = document.getElementById("NostrExtensionButton");
         var errorBox = document.getElementById("NostrExtensionError");
+        var useSignerRow = document.getElementById("NostrUseSignerAppRow");
+        var divider = document.getElementById("NostrOrDivider");
         var label = button.textContent;
 
-        // Extensions inject window.nostr at or after document_end; give them a moment.
+        function qrNeeded() {
+            if (window.__nostrQrNeeded) return;
+            window.__nostrQrNeeded = true;
+            useSignerRow.hidden = true;
+            divider.hidden = box.hidden;
+            document.dispatchEvent(new Event("nostr-qr-needed"));
+        }
+
+        function hasExtension() {
+            return window.nostr && typeof window.nostr.signEvent === "function";
+        }
+
+        // Extensions inject window.nostr at or after document_end. Decide about the QR after
+        // ~0.8 s; keep watching up to ~3 s so a late extension still gets its button.
         var attempts = 0;
         (function detect() {
-            if (window.nostr && typeof window.nostr.signEvent === "function") {
+            if (hasExtension()) {
                 box.hidden = false;
-            } else if (++attempts < 30) {
-                setTimeout(detect, 100);
+                var preparing = document.getElementById("NostrQrPreparing");
+                if (preparing) preparing.hidden = true;
+                if (window.__nostrQrNeeded) divider.hidden = false;
+                else useSignerRow.hidden = false;
+                return;
             }
+            attempts++;
+            if (attempts === 8) qrNeeded();
+            if (attempts < 30) setTimeout(detect, 100);
         })();
+
+        document.getElementById("NostrUseSignerApp").addEventListener("click", qrNeeded);
 
         function fail(message) {
             errorBox.textContent = message;

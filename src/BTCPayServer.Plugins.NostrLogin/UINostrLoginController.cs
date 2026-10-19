@@ -328,6 +328,8 @@ public class UINostrLoginController : Controller
         var session = _nostrLoginService.GetSession(sessionId);
         if (session is null || session.Purpose != Nip46SessionPurpose.Login)
             return Json(new { status = "failed", error = "Session expired. Reload the page to try again." });
+        // The page polls only once the QR is shown: that is when the relays are needed.
+        _nostrLoginService.EnsureRelaysStarted(session);
         switch (session.Status)
         {
             case Nip46SessionStatus.Pending:
@@ -752,6 +754,7 @@ public class UINostrLoginController : Controller
         var session = _nostrLoginService.GetSession(sessionId);
         if (user is null || session is null || session.Purpose != Nip46SessionPurpose.Link || session.LinkUserId != user.Id)
             return Json(new { status = "failed", error = "Session expired. Reload the page to try again." });
+        _nostrLoginService.EnsureRelaysStarted(session); // first poll = QR shown
         switch (session.Status)
         {
             case Nip46SessionStatus.Pending:
