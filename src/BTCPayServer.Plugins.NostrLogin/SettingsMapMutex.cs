@@ -33,6 +33,30 @@ public static class SettingsMapMutex
         }
     }
 
+    /// <summary>
+    /// Check-and-mutate under the same lock: <paramref name="tryMutate"/> inspects the current
+    /// map, mutates it and returns true, or returns false to leave it untouched (nothing is
+    /// persisted). Use this whenever a write depends on a read (ownership checks), so the
+    /// decision can never be made on a copy another writer has since changed.
+    /// </summary>
+    public static async Task<bool> TryUpdateAsync<T>(ISettingsRepository repository, Func<T, bool> tryMutate)
+        where T : class, new()
+    {
+        await Lock.WaitAsync();
+        try
+        {
+            var map = await repository.GetSettingAsync<T>() ?? new T();
+            if (!tryMutate(map))
+                return false;
+            await repository.UpdateSetting(map);
+            return true;
+        }
+        finally
+        {
+            Lock.Release();
+        }
+    }
+
     /// <summary>Synchronous convenience overload of <see cref="UpdateAsync{T}"/>.</summary>
     public static Task UpdateAsync<T>(ISettingsRepository repository, Action<T> mutate)
         where T : class, new()

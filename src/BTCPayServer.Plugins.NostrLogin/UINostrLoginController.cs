@@ -609,15 +609,18 @@ public class UINostrLoginController : Controller
         }
 
         var pubkey = session.UserPubkey!;
-        var map = await GetUserMap();
-        if (map.PubkeyToUserId.TryGetValue(pubkey, out var ownerId) && ownerId != user.Id)
+        // Ownership check and write under one lock: two concurrent links of the same key must
+        // not both pass the check and race to last-write-wins.
+        var linked = await SettingsMapMutex.TryUpdateAsync<NostrLoginUserMap>(_settingsRepository, m =>
         {
-            _nostrLoginService.RemoveSession(session.Id);
-            return Json(new { status = "failed", error = "This Nostr key is already linked to another account." });
-        }
-        await SettingsMapMutex.UpdateAsync<NostrLoginUserMap>(_settingsRepository,
-            m => m.PubkeyToUserId[pubkey] = user.Id);
+            if (m.PubkeyToUserId.TryGetValue(pubkey, out var ownerId) && ownerId != user.Id)
+                return false;
+            m.PubkeyToUserId[pubkey] = user.Id;
+            return true;
+        });
         _nostrLoginService.RemoveSession(session.Id);
+        if (!linked)
+            return Json(new { status = "failed", error = "This Nostr key is already linked to another account." });
 
         return Json(new { status = "approved", redirect = Url.Action(nameof(Account)) });
     }
@@ -629,11 +632,11 @@ public class UINostrLoginController : Controller
         var user = await _userManager.GetUserAsync(User);
         if (user is null)
             return NotFound();
-        var map = await GetUserMap();
-        if (map.PubkeyToUserId.TryGetValue(pubkey, out var ownerId) && ownerId == user.Id)
+        var removed = await SettingsMapMutex.TryUpdateAsync<NostrLoginUserMap>(_settingsRepository,
+            m => m.PubkeyToUserId.TryGetValue(pubkey, out var ownerId) && ownerId == user.Id
+                 && m.PubkeyToUserId.Remove(pubkey));
+        if (removed)
         {
-            await SettingsMapMutex.UpdateAsync<NostrLoginUserMap>(_settingsRepository,
-                m => m.PubkeyToUserId.Remove(pubkey));
             // Purge the avatar-map row this pubkey left behind (audit finding 11) so a stale
             // source URL cannot suppress a future re-sync for a different identity.
             await SettingsMapMutex.UpdateAsync<NostrLoginAvatarMap>(_settingsRepository,
@@ -727,8 +730,17 @@ public class UINostrLoginController : Controller
         var result = await _userManager.CreateAsync(user, password);
         if (!result.Succeeded)
             return (null, "Could not create a new account for this Nostr key.");
-        await SettingsMapMutex.UpdateAsync<NostrLoginUserMap>(_settingsRepository,
-            m => m.PubkeyToUserId[pubkey] = user.Id);
+        // Claim the key only if nobody linked it meanwhile (never overwrite an existing owner).
+        string? winnerId = null;
+        var claimed = await SettingsMapMutex.TryUpdateAsync<NostrLoginUserMap>(_settingsRepository,
+            m => !m.PubkeyToUserId.TryGetValue(pubkey, out winnerId) && m.PubkeyToUserId.TryAdd(pubkey, user.Id));
+        if (!claimed)
+        {
+            // Lost the race: drop the account we just created and sign in as the linked owner.
+            await _userManager.DeleteAsync(user);
+            var owner = winnerId is null ? null : await _userManager.FindByIdAsync(winnerId);
+            return owner is null ? (null, "Could not create a new account for this Nostr key.") : (owner, null);
+        }
         // With RequiresUserApproval the subsequent CanLogin check reports the pending state.
         return (user, null);
     }
