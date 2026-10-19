@@ -46,9 +46,10 @@
         }
 
         // Extensions inject window.nostr at or after document_end. Decide about the QR after
-        // ~0.8 s; keep watching up to ~3 s so a late extension still gets its button.
+        // ~0.8 s; keep watching up to ~3 s so a late extension still gets its button. Starts at
+        // DOMContentLoaded: this partial renders before the page's QR placeholder exists.
         var attempts = 0;
-        (function detect() {
+        function detect() {
             if (hasExtension()) {
                 box.hidden = false;
                 var preparing = document.getElementById("NostrQrPreparing");
@@ -60,7 +61,9 @@
             attempts++;
             if (attempts === 8) qrNeeded();
             if (attempts < 30) setTimeout(detect, 100);
-        })();
+        }
+        if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", detect);
+        else detect();
 
         document.getElementById("NostrUseSignerApp").addEventListener("click", qrNeeded);
 
