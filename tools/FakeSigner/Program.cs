@@ -56,7 +56,7 @@ try
         }
     }
 }
-catch (FormatException ex)
+catch (Exception ex) when (ex is FormatException or OverflowException)
 {
     Console.Error.WriteLine($"{ex.Message}\n{usage}");
     return 1;
@@ -77,7 +77,16 @@ if (secret is null || relays is null)
     return 1;
 }
 
-var signerKey = LoadSignerKey(keyFile);
+NBitcoin.Secp256k1.ECPrivKey signerKey;
+try
+{
+    signerKey = LoadSignerKey(keyFile);
+}
+catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or ArgumentException)
+{
+    Console.Error.WriteLine($"could not load signer key: {ex.Message}");
+    return 1;
+}
 var signerPubkeyHex = signerKey.CreateXOnlyPubKey().ToHex();
 var clientPubkey = NostrExtensions.ParsePubKey(clientPubkeyHex);
 
@@ -196,12 +205,16 @@ async Task<int?> Handle(Rpc req)
 // NOSTR_SIGNER_KEY > --key-file (created 0600 with a fresh key if missing) > throwaway key.
 static NBitcoin.Secp256k1.ECPrivKey LoadSignerKey(string? keyFile)
 {
+    static NBitcoin.Secp256k1.ECPrivKey ParseHexKey(string hex) =>
+        hex.Trim() is { Length: 64 } h ? NostrExtensions.ParseKey(h)
+            : throw new FormatException("signer key must be 64 hex characters");
+
     if (Environment.GetEnvironmentVariable("NOSTR_SIGNER_KEY") is { Length: > 0 } envKey)
-        return NostrExtensions.ParseKey(envKey.Trim());
+        return ParseHexKey(envKey);
     if (keyFile is null)
         return NostrExtensions.ParseKey(RandomNumberGenerator.GetBytes(32));
     if (File.Exists(keyFile))
-        return NostrExtensions.ParseKey(File.ReadAllText(keyFile).Trim());
+        return ParseHexKey(File.ReadAllText(keyFile));
 
     var key = NostrExtensions.ParseKey(RandomNumberGenerator.GetBytes(32));
     var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };

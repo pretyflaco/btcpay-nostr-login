@@ -57,6 +57,10 @@ internal sealed class MaxMessageSizeWebSocket : WebSocket
         if (_currentMessageBytes > _maxMessageBytes)
         {
             _inner.Abort();
+            // Throwing (not returning a truncated/close result) is deliberate: it is the only way
+            // to stop NNostr's receive loop before it buffers more. The exception surfaces from
+            // NNostr's fire-and-forget ListenForMessages task as an unobserved task exception —
+            // harmless on .NET (no crash, not logged). Do not "fix" this into a soft return.
             throw new WebSocketException(WebSocketError.Faulted,
                 $"Relay message exceeded {_maxMessageBytes} bytes; connection aborted.");
         }
