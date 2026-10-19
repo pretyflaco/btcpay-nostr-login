@@ -108,10 +108,34 @@ public class UINostrLoginController : Controller
 
     /// <summary>This instance's base URL, advertised to the signer so multiple BTCPay instances
     /// are distinguishable (they otherwise all show the same generic name).</summary>
-    private string InstanceUrl() => $"{Request.Scheme}://{Request.Host}";
+    private string InstanceUrl() => $"{Request.Scheme}://{AdvertisedHost()}";
 
     /// <summary>App name shown by the signer, suffixed with the host so instances can be told apart.</summary>
-    private string InstanceAppName() => $"BTCPay Server ({Request.Host})";
+    private string InstanceAppName() => $"BTCPay Server ({AdvertisedHost()})";
+
+    /// <summary>Longest host we embed in the nostrconnect URI (DNS names cap at 253 chars).</summary>
+    private const int MaxAdvertisedHostLength = 253;
+
+    /// <summary>
+    /// Request host for the nostrconnect <c>name</c>/<c>url</c> params, clamped: the Host header
+    /// is client-influenced (direct exposure / trusted forwarded headers), and an oversized one
+    /// pushed the URI past the QR capacity (QRCoder DataTooLongException on anonymous GET).
+    /// </summary>
+    private string AdvertisedHost()
+    {
+        var host = Request.Host.Value ?? "";
+        return host.Length <= MaxAdvertisedHostLength ? host : host[..MaxAdvertisedHostLength];
+    }
+
+    /// <summary>
+    /// <paramref name="returnUrl"/> when it is a local URL made of printable ASCII, else "/".
+    /// Non-ASCII passes IsLocalUrl but makes Kestrel throw when it is written to the Location
+    /// header (a 500 after an otherwise valid sign-in).
+    /// </summary>
+    internal static string SafeReturnUrl(IUrlHelper url, string? returnUrl) =>
+        returnUrl is not null && url.IsLocalUrl(returnUrl) && returnUrl.All(c => c >= 0x20 && c < 0x7F)
+            ? returnUrl
+            : "/";
 
     /// <summary>
     /// Rate-limit key: client IP when available; else the authenticated principal's id; the
@@ -146,15 +170,42 @@ public class UINostrLoginController : Controller
     private NostrLoginViewModel ToViewModel(Nip46Session session, string statusUrl, string? returnUrl = null)
     {
         var failedUpFront = session.Status == Nip46SessionStatus.Failed;
+        var qr = failedUpFront ? null : TryGenerateQrDataUri(session.ConnectUri);
+        var qrFailed = !failedUpFront && qr is null;
+        if (qrFailed)
+        {
+            // Cannot show the QR (URI over the QR capacity, e.g. an oversized relay list): end
+            // the session instead of leaving a pending one the user can never complete.
+            _logger.LogWarning("NostrLogin session {SessionId}: connect URI too long for a QR code ({Length} chars)",
+                session.Id, session.ConnectUri.Length);
+            _nostrLoginService.RemoveSession(session.Id);
+        }
         return new()
         {
             SessionId = session.Id,
             ConnectUri = session.ConnectUri,
-            QrDataUri = failedUpFront ? "" : GenerateQrDataUri(session.ConnectUri),
+            QrDataUri = qr ?? "",
             StatusUrl = statusUrl,
             ReturnUrl = returnUrl,
-            InitialError = failedUpFront ? session.Error : null
+            // Explicit message for the QR case: RemoveSession cancels the background task, which
+            // may race to set its own (misleading) timeout error on the session.
+            InitialError = qrFailed
+                ? "Could not render the sign-in QR code. An administrator should check the Nostr Login relay settings."
+                : failedUpFront ? session.Error : null
         };
+    }
+
+    /// <summary>QR PNG data URI, or null when the data does not fit a QR code (never throws).</summary>
+    internal static string? TryGenerateQrDataUri(string data)
+    {
+        try
+        {
+            return GenerateQrDataUri(data);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private static string GenerateQrDataUri(string data)
@@ -170,7 +221,7 @@ public class UINostrLoginController : Controller
     public async Task<IActionResult> Login(string? returnUrl = null)
     {
         if (User.Identity?.IsAuthenticated is true)
-            return Redirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
+            return Redirect(SafeReturnUrl(Url, returnUrl));
 
         // M2/session reuse: the bind cookie value is "{sessionId}.{nonce}". A browser returning
         // with a valid cookie for a still-pending session gets the same QR re-rendered instead of
@@ -313,7 +364,7 @@ public class UINostrLoginController : Controller
         _logger.LogInformation("NostrLogin session {SessionId}: approved for user {UserId}", session.Id, user.Id);
         _nostrLoginService.RemoveSession(session.Id); // single use, removed only after success
         Response.Cookies.Delete(BindCookieName);
-        var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
+        var redirect = SafeReturnUrl(Url, returnUrl);
         return Json(new { status = "approved", redirect });
     }
 
@@ -445,7 +496,7 @@ public class UINostrLoginController : Controller
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         _logger.LogInformation("NostrLogin NIP-98 login: approved for user {UserId}", user.Id);
-        var redirect = Url.IsLocalUrl(returnUrl) ? returnUrl! : "/";
+        var redirect = SafeReturnUrl(Url, returnUrl);
         return Json(new { status = "approved", redirect });
     }
 
@@ -510,7 +561,7 @@ public class UINostrLoginController : Controller
 
         await _signInManager.SignInAsync(user, false, "NostrLogin");
         _logger.LogInformation("NostrLogin NIP-98 login link: approved for user {UserId}", user.Id);
-        return LocalRedirect(Url.IsLocalUrl(returnUrl) ? returnUrl! : "/");
+        return LocalRedirect(SafeReturnUrl(Url, returnUrl));
     }
 
     /// <summary>Decode an <c>Authorization: Nostr &lt;base64-json-event&gt;</c> header to an event, or null.</summary>
@@ -674,6 +725,10 @@ public class UINostrLoginController : Controller
             if (!Uri.TryCreate(relay, UriKind.Absolute, out var uri) || (uri.Scheme != "wss" && uri.Scheme != "ws"))
                 ModelState.AddModelError(nameof(model.Relays), $"Invalid relay URL: {relay} (must be ws:// or wss://)");
         }
+        // The relays are embedded in the nostrconnect QR code, which has a hard size limit.
+        if (NostrLoginService.RelayParamsLength(relays) > NostrLoginService.MaxRelayParamsLength)
+            ModelState.AddModelError(nameof(model.Relays),
+                "Too many or too long relay URLs: the sign-in QR code cannot hold them. Use fewer relays.");
         if (!ModelState.IsValid)
         {
             model.LinkedKeyCount = (await GetUserMap()).PubkeyToUserId.Count;

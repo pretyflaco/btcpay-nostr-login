@@ -73,9 +73,9 @@ public class LoginButtonInjectionMiddleware
 
     private static string? TryInjectButton(string html, HttpRequest request)
     {
-        // Never throw from here: this runs on every GET /login, and BTCPay core disables the
-        // plugin and restarts the server on any unhandled plugin exception. On failure the page
-        // is simply served unchanged.
+        // Never throw from here: this runs on every GET /login. (This middleware sits outside
+        // core's UseExceptionHandler, so it cannot trip the plugin kill switch — but an exception
+        // would still break the core login page with a 500.) On failure the page is served unchanged.
         try
         {
             var pathBase = request.PathBase.HasValue ? request.PathBase.Value : "";

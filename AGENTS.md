@@ -115,8 +115,11 @@ cd submodules/btcpayserver/BTCPayServer.Tests && docker compose up -d dev
   a value-less `["u"]` tag hit NNostr's `GetTaggedData` → `.First()`). Read tags / verify
   signatures of untrusted events only via `UntrustedEvent` (never NNostr's `GetTaggedData` /
   `Verify` directly). `[ContainPluginExceptions]` on the controller is the safety net (logs +
-  500 instead of the kill switch) — keep it, and keep `MalformedEventTests` covering every
-  anonymous entry point.
+  500 instead of the kill switch, for both action and result execution) — keep it, and keep
+  `MalformedEventTests` covering every anonymous entry point. Note core also blames a plugin
+  when an exception *message* contains its assembly name, so never echo raw input into
+  exception messages. (The login-button middleware runs outside core's exception handler; its
+  try/catch is about keeping /login up, not the kill switch.)
 - **Rate limiting** on anonymous login-session creation (per IP). Ephemeral
   per-session keys are zeroized on resolution.
 - **Auto user creation** is off by default and, when enabled, still honours the
