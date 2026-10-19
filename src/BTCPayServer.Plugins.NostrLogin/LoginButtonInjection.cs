@@ -73,9 +73,19 @@ public class LoginButtonInjectionMiddleware
 
     private static string? TryInjectButton(string html, HttpRequest request)
     {
-        var pathBase = request.PathBase.HasValue ? request.PathBase.Value : "";
-        var returnUrl = request.Query["returnUrl"];
-        return TryInjectButton(html, pathBase ?? "", returnUrl);
+        // Never throw from here: this runs on every GET /login, and BTCPay core disables the
+        // plugin and restarts the server on any unhandled plugin exception. On failure the page
+        // is simply served unchanged.
+        try
+        {
+            var pathBase = request.PathBase.HasValue ? request.PathBase.Value : "";
+            var returnUrl = request.Query["returnUrl"];
+            return TryInjectButton(html, pathBase ?? "", returnUrl);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     internal static string? TryInjectButton(string html, string pathBase, string? returnUrl)

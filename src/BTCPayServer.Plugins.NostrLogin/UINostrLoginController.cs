@@ -54,6 +54,7 @@ public class NostrLoginServerSettingsViewModel
     public string[] DefaultRelays { get; set; } = [];
 }
 
+[ContainPluginExceptions]
 public class UINostrLoginController : Controller
 {
     private readonly NostrLoginService _nostrLoginService;

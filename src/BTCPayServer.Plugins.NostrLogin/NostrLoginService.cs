@@ -799,12 +799,12 @@ public class NostrLoginService : IDisposable
             return "Signed event has the wrong kind.";
         if (!string.Equals(signed.PublicKey, expectedPubkey, StringComparison.OrdinalIgnoreCase))
             return "Signed event pubkey does not match the signer's user pubkey.";
-        if (!signed.GetTaggedData("challenge").Contains(expectedChallenge))
+        if (!UntrustedEvent.TagValues(signed, "challenge").Contains(expectedChallenge))
             return "Signed event does not contain the expected challenge.";
         var age = DateTimeOffset.UtcNow - (signed.CreatedAt ?? DateTimeOffset.MinValue);
         if (age > TimeSpan.FromMinutes(SignedEventMaxAgeMinutes) || age < TimeSpan.FromMinutes(-SignedEventMaxAgeMinutes))
             return "Signed event timestamp is out of range.";
-        if (!signed.Verify())
+        if (!UntrustedEvent.Verify(signed))
             return "Signed event has an invalid signature.";
         return null;
     }
