@@ -116,8 +116,10 @@ public class LoginButtonInjectionMiddleware
             "<style>" +
             "#login-form .d-flex.gap-2{flex-wrap:wrap;}" +
             "#login-form .d-flex.gap-2>.btn{flex:1 1 120px;}" +
-            // Keep "Nostr Login" on one line; on narrow screens the row wraps the button instead.
-            "#login-form .nostr-login-btn{white-space:nowrap;}" +
+            // Keep "Nostr Login" on one line (on narrow screens the row wraps the button instead),
+            // and centre it vertically like core's <button>s when a sibling wraps to two lines
+            // (an <a class="btn"> does not centre by itself; inside flex the gap replaces the space).
+            "#login-form .nostr-login-btn{white-space:nowrap;display:flex;align-items:center;justify-content:center;gap:.25rem;}" +
             "</style>";
 
         return html.Insert(insertAt, button);
