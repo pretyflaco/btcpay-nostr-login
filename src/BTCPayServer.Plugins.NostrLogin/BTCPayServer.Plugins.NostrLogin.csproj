@@ -6,8 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <Product>Nostr Login</Product>
-    <Description>Sign in to BTCPay Server with a NIP-46 Nostr remote signer (Nostr Connect). Additive: password, Passkey and LoginCode remain untouched.</Description>
-    <Version>0.9.2.0</Version>
+    <Description>Sign in to BTCPay Server with Nostr: a browser extension (NIP-07) or a remote signer (NIP-46). No password, no email, and your key never leaves your signer.</Description>
+    <Version>0.9.3.1</Version>
   </PropertyGroup>
 
   <!-- Plugin development properties -->

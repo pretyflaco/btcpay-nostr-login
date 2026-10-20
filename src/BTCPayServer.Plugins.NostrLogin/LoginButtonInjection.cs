@@ -110,10 +110,16 @@ public class LoginButtonInjectionMiddleware
         var button =
             $"<a href=\"{href}\" class=\"btn btn-outline-secondary w-100 nostr-login-btn\" id=\"nostr-login-btn\" title=\"Sign in with Nostr: browser extension or signer app\">" +
             $"<svg role=\"img\" class=\"icon icon-social-nostr\"><use href=\"{pathBase}/img/icon-sprite.svg#social-nostr\"></use></svg>" +
-            "<span>Nostr Login</span></a>" +
+            // The space matters: core's buttons get their icon/label gap from the whitespace
+            // between <svg> and <span> in the Razor markup.
+            " <span>Nostr Login</span></a>" +
             "<style>" +
             "#login-form .d-flex.gap-2{flex-wrap:wrap;}" +
             "#login-form .d-flex.gap-2>.btn{flex:1 1 120px;}" +
+            // Keep "Nostr Login" on one line (on narrow screens the row wraps the button instead),
+            // and centre it vertically like core's <button>s when a sibling wraps to two lines
+            // (an <a class="btn"> does not centre by itself; inside flex the gap replaces the space).
+            "#login-form .nostr-login-btn{white-space:nowrap;display:flex;align-items:center;justify-content:center;gap:.25rem;}" +
             "</style>";
 
         return html.Insert(insertAt, button);

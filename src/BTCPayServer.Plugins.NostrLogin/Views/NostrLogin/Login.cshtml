@@ -15,9 +15,13 @@
     else
     {
         <partial name="/Views/NostrLogin/_ExtensionSigner.cshtml" model="Model" />
-        <div class="d-flex align-items-center justify-content-center my-4 text-secondary" id="NostrQrPreparing">
-            <div class="spinner-border spinner-border-sm" role="status"></div>
-            <span class="ms-2">Preparing sign-in&hellip;</span>
+        @* Shown by _ExtensionSigner only if deciding takes > 300 ms; hidden on a plain wrapper
+           because .d-flex (display:flex !important) overrides the hidden attribute. *@
+        <div id="NostrQrPreparing" hidden>
+            <div class="d-flex align-items-center justify-content-center my-4 text-secondary">
+                <div class="spinner-border spinner-border-sm" role="status"></div>
+                <span class="ms-2">Preparing sign-in&hellip;</span>
+            </div>
         </div>
         @* Shown (and polled, which starts the relays server-side) only once the QR is needed. *@
         <div id="NostrQrSection" hidden>
@@ -36,9 +40,11 @@
                     <small>On this device? Open your NIP-46 signer app (such as Amber) and approve there — this page completes the sign-in.</small>
                 </p>
             </div>
-            <div class="d-flex align-items-center justify-content-center mt-4" id="NostrPending">
-                <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
-                <span class="ms-2 text-secondary">Waiting for signer approval&hellip;</span>
+            <div id="NostrPending">
+                <div class="d-flex align-items-center justify-content-center mt-4">
+                    <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
+                    <span class="ms-2 text-secondary">Waiting for signer approval&hellip;</span>
+                </div>
             </div>
             <div class="alert alert-info mt-4" id="NostrAuthUrl" style="display:none;">
                 Your signer needs an extra approval step.
