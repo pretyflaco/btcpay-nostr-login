@@ -88,7 +88,9 @@ cd submodules/btcpayserver/BTCPayServer.Tests && docker compose up -d dev
   GET, and never show the QR before polling starts (the connect ack below is
   one-shot). A dormant session that ends wipes its key in `OnDormantSessionEnded`
   and reports `no-poll` expiry (feeds the probe counter); `RemoveSession` marks
-  `Removed` so completions are not logged as expiries.
+  `Removed` so completions are not logged as expiries. Starting the relays restarts
+  the session lifetime (`RelaysStartedAt`, `Cts.CancelAfter`); every lifetime check
+  (extension proof, QR reuse, Cleanup) goes through `NostrLoginService.Deadline`.
 - **The connect ack is one-shot.** The kind-24133 subscription must be created
   *before* reading events. Keep that ordering in `RunSessionAsync`.
 - **nostrconnect URI** is built in `NostrLoginService.BuildConnectUri`. It emits
