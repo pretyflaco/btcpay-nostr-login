@@ -21,7 +21,9 @@ public class LoginButtonInjectionTests
         Assert.NotNull(result);
         Assert.Contains("id=\"nostr-login-btn\"", result);
         Assert.Contains("href=\"/login/nostr\"", result);
-        Assert.Contains("<span>Nostr Login</span>", result);
+        // Space between icon and label (core's gap comes from that whitespace), kept on one line.
+        Assert.Contains("</svg> <span>Nostr Login</span>", result);
+        Assert.Contains(".nostr-login-btn{white-space:nowrap;}", result);
         // Injected inside the flex row (before its closing tag)
         Assert.True(result!.IndexOf("nostr-login-btn") < result.LastIndexOf("</div>"));
     }
