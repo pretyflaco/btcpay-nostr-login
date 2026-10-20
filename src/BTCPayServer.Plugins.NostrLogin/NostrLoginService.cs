@@ -111,6 +111,10 @@ public class Nip46Session
     /// </summary>
     internal int RelayState;
 
+    /// <summary>When the relays were started (first status poll). The session lifetime restarts
+    /// then, so a QR opened late (e.g. after first considering the extension) gets a full lifetime.</summary>
+    internal DateTimeOffset? RelaysStartedAt { get; set; }
+
     /// <summary>Starts the background relay/RPC task; invoked at most once (guarded by <see cref="RelayState"/>).</summary>
     internal Action? StartRelays { get; set; }
 
@@ -410,7 +414,7 @@ public class NostrLoginService : IDisposable
             return null;
         if (!BindingNonceMatches(session.BindingNonce, presentedNonce))
             return null;
-        if (DateTimeOffset.UtcNow - session.CreatedAt > SessionLifetime - ReuseMinRemaining)
+        if (Deadline(session) - DateTimeOffset.UtcNow < ReuseMinRemaining)
             return null;
         return session;
     }
@@ -423,7 +427,15 @@ public class NostrLoginService : IDisposable
     /// </summary>
     internal static bool AcceptsExtensionProof(Nip46Session session) =>
         session.Status != Nip46SessionStatus.Approved
-        && DateTimeOffset.UtcNow - session.CreatedAt <= SessionLifetime;
+        && DateTimeOffset.UtcNow <= Deadline(session);
+
+    /// <summary>
+    /// When the session's lifetime ends: <see cref="SessionLifetime"/> after the relays started (the
+    /// timer is reset then, see <see cref="EnsureRelaysStarted"/>), or after creation while dormant.
+    /// Every lifetime check uses this so they agree with the cancellation timer.
+    /// </summary>
+    internal static DateTimeOffset Deadline(Nip46Session session) =>
+        (session.RelaysStartedAt ?? session.CreatedAt) + SessionLifetime;
 
     public void RemoveSession(string id)
     {
@@ -441,8 +453,14 @@ public class NostrLoginService : IDisposable
     internal void EnsureRelaysStarted(Nip46Session session)
     {
         if (Interlocked.CompareExchange(ref session.RelayState, Nip46Session.RelaysStarted, Nip46Session.RelaysDormant)
-            == Nip46Session.RelaysDormant)
-            session.StartRelays?.Invoke();
+            != Nip46Session.RelaysDormant)
+            return;
+        // The QR is shown from now on: give it a full lifetime from this moment (a user who first
+        // looked at the extension option and opens the QR minutes later must not get a QR that
+        // expires almost immediately). Resets the pending cancellation timer.
+        session.RelaysStartedAt = DateTimeOffset.UtcNow;
+        session.Cts.CancelAfter(SessionLifetime);
+        session.StartRelays?.Invoke();
     }
 
     private void OnDormantSessionEnded(Nip46Session session, ECPrivKey clientKey)
@@ -487,9 +505,9 @@ public class NostrLoginService : IDisposable
     private void Cleanup()
     {
         var now = DateTimeOffset.UtcNow;
-        var cutoff = now - SessionLifetime - TimeSpan.FromMinutes(5);
+        var grace = TimeSpan.FromMinutes(5);
         foreach (var (id, session) in _sessions)
-            if (session.CreatedAt < cutoff)
+            if (Deadline(session) + grace < now)
                 RemoveSession(id);
 
         // Sweep stale rate-limit windows so the dictionary cannot grow unbounded.

@@ -107,6 +107,48 @@ public class LazyRelayTests
         Assert.DoesNotContain(logger.Entries, e => e.Message.Contains("expired unauthenticated"));
     }
 
+    // --- lifetime restarts when the relays start (QR opened late gets a full lifetime) ---
+
+    [Fact]
+    public async Task LateRelayStart_RestartsLifetime()
+    {
+        var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
+        var session = await NewSession(service);
+        session.StartRelays = () => { };
+        session.CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-4.5); // user looked at the extension option first
+
+        Assert.True(NostrLoginService.Deadline(session) - DateTimeOffset.UtcNow < TimeSpan.FromMinutes(1));
+
+        service.EnsureRelaysStarted(session); // ...then picked "Use a signer app"
+
+        var remaining = NostrLoginService.Deadline(session) - DateTimeOffset.UtcNow;
+        Assert.InRange(remaining, TimeSpan.FromMinutes(4.9), TimeSpan.FromMinutes(5));
+    }
+
+    [Fact]
+    public async Task LifetimeChecks_FollowTheDeadline()
+    {
+        var service = new NostrLoginService(NullLogger<NostrLoginService>.Instance);
+        const string nonce = "n0nce";
+        var dormant = await service.CreateSessionAsync(Nip46SessionPurpose.Login, [BlackholeRelay], "test", bindingNonce: nonce);
+        var started = await service.CreateSessionAsync(Nip46SessionPurpose.Login, [BlackholeRelay], "test", bindingNonce: nonce);
+        started.StartRelays = () => { };
+        dormant.CreatedAt = started.CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-6); // past the creation-based lifetime
+        service.EnsureRelaysStarted(started);
+
+        // Extension proof + QR reuse: dormant one is over, the late-started one is not.
+        Assert.False(NostrLoginService.AcceptsExtensionProof(dormant));
+        Assert.True(NostrLoginService.AcceptsExtensionProof(started));
+        Assert.Null(service.TryReuseSession(dormant.Id, nonce));
+        Assert.Same(started, service.TryReuseSession(started.Id, nonce));
+
+        // Cleanup (runs on session creation) sweeps by deadline + grace, not by creation time.
+        dormant.CreatedAt = started.CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-11);
+        await NewSession(service);
+        Assert.Null(service.GetSession(dormant.Id));
+        Assert.NotNull(service.GetSession(started.Id));
+    }
+
     [Fact]
     public async Task StatusPoll_StartsRelays_PageGetDoesNot()
     {
