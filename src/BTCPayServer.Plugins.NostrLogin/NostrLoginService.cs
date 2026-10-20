@@ -100,15 +100,33 @@ public class Nip46Session
     internal int RelaysConnected { get; set; } = -1;
 
     internal CancellationTokenSource Cts { get; } = new();
+
+    // --- Lazy relay start ---
+    internal const int RelaysDormant = 0, RelaysStarted = 1, RelaysNeverStarted = 2;
+
+    /// <summary>
+    /// Relay lifecycle: Dormant until the first status poll (<see cref="NostrLoginService.EnsureRelaysStarted"/>),
+    /// then Started (RunSessionAsync owns the ephemeral key); NeverStarted when the session ended while
+    /// still dormant (key zeroized by the end-of-life callback). Transitions are CAS-only.
+    /// </summary>
+    internal int RelayState;
+
+    /// <summary>Starts the background relay/RPC task; invoked at most once (guarded by <see cref="RelayState"/>).</summary>
+    internal Action? StartRelays { get; set; }
+
+    /// <summary>Set by RemoveSession before cancelling, so the end of a session that was completed or
+    /// discarded (e.g. NIP-07 sign-in, QR render failure) is not logged/counted as an unauthenticated expiry.</summary>
+    internal volatile bool Removed;
 }
 
 /// <summary>
 /// Manages NIP-46 (Nostr Connect) sign-in sessions. For each session an ephemeral client key
-/// is generated and a nostrconnect:// URI is displayed as QR code. The relay connections and
-/// the kind-24133 subscription are established BEFORE the session is returned (and the QR is
-/// rendered): the signer's connect ack is an ephemeral event sent exactly once, so we must
-/// already be listening when the signer scans. A background task then drives the RPC flow
-/// (connect ack -> get_public_key -> sign_event kind-22242) and validates the result.
+/// is generated and a nostrconnect:// URI is displayed as QR code. Sessions are created dormant;
+/// the first status poll (sent by the page only once it actually shows the QR) starts a
+/// background task that connects the relays, subscribes kind-24133 BEFORE reading (the signer's
+/// connect ack is an ephemeral event sent exactly once), and drives the RPC flow (connect ack ->
+/// get_public_key -> sign_event, NIP-98 kind 27235 with a 22242 fallback). The same session also
+/// accepts a NIP-07 browser-extension proof, which needs no relays at all.
 /// </summary>
 public class NostrLoginService : IDisposable
 {
@@ -263,9 +281,17 @@ public class NostrLoginService : IDisposable
             "NostrLogin session {SessionId} created (purpose={Purpose}, relays=[{Relays}], relaySource={RelaySource})",
             session.Id, purpose, string.Join(", ", relays), relaysFromSettings ? "settings" : "defaults");
 
-        // Everything relay-related runs off the request thread. The QR is returned synchronously
-        // below; by the time a human scans it (seconds later) the background connect has completed.
-        _ = Task.Run(() => RunSessionAsync(session, clientKey, clientPubkey, secret, relays, diagnostics, loginUrl));
+        // Relays are NOT connected here: the session stays dormant until the first status poll
+        // (EnsureRelaysStarted). The page only polls once the QR is actually shown (no NIP-07
+        // extension detected, or the user chose the signer app), so page views without JS (crawlers,
+        // probers) and extension sign-ins never open relay connections. The poll arrives before the
+        // QR is visible, so the subscription is live long before a human can scan it (the signer's
+        // connect ack is one-shot). Everything relay-related still runs off the request thread.
+        session.StartRelays = () =>
+            _ = Task.Run(() => RunSessionAsync(session, clientKey, clientPubkey, secret, relays, diagnostics, loginUrl));
+        // End of life (lifetime expiry or RemoveSession) while still dormant: nothing else owns the
+        // key, so wipe it here (M1) and record the expiry like RunSessionAsync would.
+        session.Cts.Token.Register(() => OnDormantSessionEnded(session, clientKey));
 
         return Task.FromResult(session);
     }
@@ -288,6 +314,8 @@ public class NostrLoginService : IDisposable
             // Connect to all relays in parallel and tolerate partial failures: one dead relay must
             // neither kill the session nor delay the others.
             var connected = await pool.ConnectAsync(ct);
+            // Ended mid-connect: handled by the cancellation path below (expiry vs removal).
+            ct.ThrowIfCancellationRequested();
             session.RelaysConnected = connected;
             if (connected == 0)
             {
@@ -310,9 +338,10 @@ public class NostrLoginService : IDisposable
         }
         catch (OperationCanceledException)
         {
-            // The Cts fires on session-lifetime expiry AND on RemoveSession after a terminal
-            // state; only a still-Pending session is a genuine unauthenticated expiry.
-            if (session.Status == Nip46SessionStatus.Pending)
+            // The Cts fires on session-lifetime expiry AND on RemoveSession (terminal state, or a
+            // NIP-07 completion / discard while still Pending); only a still-Pending session that
+            // was not removed is a genuine unauthenticated expiry.
+            if (session.Status == Nip46SessionStatus.Pending && !session.Removed)
             {
                 var reason = ClassifyUnauthenticatedExpiry(session);
                 _logger.LogInformation(
@@ -399,7 +428,47 @@ public class NostrLoginService : IDisposable
     public void RemoveSession(string id)
     {
         if (_sessions.TryRemove(id, out var session))
+        {
+            session.Removed = true;
             session.Cts.Cancel();
+        }
+    }
+
+    /// <summary>
+    /// Starts the session's relay connections + NIP-46 RPC flow on first call (status poll); no-op
+    /// afterwards, and for sessions that already ended. Idempotent and thread-safe.
+    /// </summary>
+    internal void EnsureRelaysStarted(Nip46Session session)
+    {
+        if (Interlocked.CompareExchange(ref session.RelayState, Nip46Session.RelaysStarted, Nip46Session.RelaysDormant)
+            == Nip46Session.RelaysDormant)
+            session.StartRelays?.Invoke();
+    }
+
+    private void OnDormantSessionEnded(Nip46Session session, ECPrivKey clientKey)
+    {
+        // Started sessions are handled by RunSessionAsync (which owns and wipes the key).
+        if (Interlocked.CompareExchange(ref session.RelayState, Nip46Session.RelaysNeverStarted, Nip46Session.RelaysDormant)
+            != Nip46Session.RelaysDormant)
+            return;
+        try
+        {
+            ZeroizeAndDispose(clientKey);
+            if (session.Status != Nip46SessionStatus.Pending || session.Removed)
+                return;
+            // Never polled: nobody ever displayed the QR (no JS client, or the user only looked at
+            // the extension option). For Login sessions this is the prober signature, so it feeds
+            // the probe counter exactly like a no-hello expiry did when relays started eagerly.
+            _logger.LogInformation("NostrLogin session {SessionId} expired unauthenticated ({Reason})",
+                session.Id, ExpiryNoPoll);
+            if (session.Purpose == Nip46SessionPurpose.Login)
+                RecordProbelessExpiry(session.OriginKey);
+            Fail(session, "Timed out waiting for signer approval.");
+        }
+        catch (Exception)
+        {
+            // Runs inside CancellationTokenSource.Cancel(); never let it throw into the caller.
+        }
     }
 
     private void Fail(Nip46Session session, string error, bool diagnostics = false)
@@ -450,6 +519,8 @@ public class NostrLoginService : IDisposable
 
     internal const string ExpiryRelayDead = "relay-dead";
     internal const string ExpiryNoHello = "no-hello";
+    /// <summary>Session expired while dormant: no status poll ever started its relays.</summary>
+    internal const string ExpiryNoPoll = "no-poll";
     internal const string ExpiryHelloNoAuth = "hello-no-auth";
 
     /// <summary>

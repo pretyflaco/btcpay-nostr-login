@@ -30,7 +30,7 @@ Nostr Login implements the [NIP-46 (Nostr Connect)](https://github.com/nostr-pro
 
 `nostrconnect://<client-pubkey>?relay=wss://nos.lol&relay=wss://relay.primal.net&secret=<secret>&perms=sign_event:22242&name=BTCPay%20Server`
 
-The signer app connects over the listed relays (NIP-46 messages are exchanged as encrypted `kind:24133` events, NIP-44 with a NIP-04 fallback) and the flow proceeds:
+The plugin only connects to the relays once the QR code is actually shown: if a NIP-07 browser extension is detected, the QR (and its relay connections) stay off until you choose "Use a signer app". The signer app connects over the listed relays (NIP-46 messages are exchanged as encrypted `kind:24133` events, NIP-44 with a NIP-04 fallback) and the flow proceeds:
 
 1. **Connect** — the signer acknowledges by echoing the one-time `secret`.
 2. **get_public_key** — the plugin requests the user's public key.
